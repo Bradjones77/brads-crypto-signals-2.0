@@ -2,7 +2,7 @@ import os
 import json
 import hashlib
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -10,26 +10,28 @@ from psycopg2.extras import RealDictCursor
 
 # ============================================================
 # BRAD'S SIGNALS BOT 2.0
-# LONG-TERM MEMORY ENGINE
+# LONG-TERM MEMORY ENGINE V2
 #
-# PURPOSE:
-# Build a permanent historical brain.
+# MEMORY HORIZONS:
+# 30 sec
+# 1 min
+# 5 min
+# 10 min
+# 30 min
+# 1 hour
+# 4 hours
+# 12 hours
+# 24 hours
 #
-# Stores:
-# - EVERY analysed opportunity
-# - sent signals
-# - rejected opportunities
-# - technical fingerprints
-# - market context
-# - confidence information
-# - AI analysis
-# - future price outcomes
-# - MFE / MAE
+# Stores BOTH:
+# - signals eventually sent
+# - opportunities eventually rejected
 #
-# THIS FILE:
-# - DOES NOT PLACE TRADES
-# - DOES NOT SEND TELEGRAM
-# - DOES NOT USE BITGET API KEYS
+# THIS FILE DOES NOT:
+# - Place trades
+# - Modify positions
+# - Send Telegram messages
+# - Use Bitget credentials
 # ============================================================
 
 
@@ -39,8 +41,11 @@ DATABASE_URL = (
 ).strip()
 
 
+MEMORY_SCHEMA_VERSION = "2.0"
+
+
 # ============================================================
-# TIME HELPERS
+# TIME
 # ============================================================
 
 
@@ -50,12 +55,8 @@ def utc_now():
     )
 
 
-def utc_iso():
-    return utc_now().isoformat()
-
-
 # ============================================================
-# JSON HELPERS
+# JSON
 # ============================================================
 
 
@@ -114,7 +115,7 @@ def build_opportunity_id(
 
 
 # ============================================================
-# DATABASE CONNECTION
+# DATABASE
 # ============================================================
 
 
@@ -152,9 +153,9 @@ def ensure_schema(conn):
 
     cur = conn.cursor()
 
-    # --------------------------------------------------------
-    # MAIN OPPORTUNITY MEMORY
-    # --------------------------------------------------------
+    # ========================================================
+    # OPPORTUNITIES
+    # ========================================================
 
     cur.execute(
         """
@@ -229,6 +230,8 @@ def ensure_schema(conn):
 
             strategy_version TEXT,
 
+            memory_schema_version TEXT,
+
             outcome_status TEXT
                 NOT NULL
                 DEFAULT 'PENDING',
@@ -239,11 +242,9 @@ def ensure_schema(conn):
         """
     )
 
-    # --------------------------------------------------------
-    # FUTURE OUTCOME MEMORY
-    #
-    # Stores what ACTUALLY happened after each opportunity.
-    # --------------------------------------------------------
+    # ========================================================
+    # OUTCOMES
+    # ========================================================
 
     cur.execute(
         """
@@ -269,41 +270,57 @@ def ensure_schema(conn):
                 TIMESTAMPTZ
                 NOT NULL,
 
-            price_10m
-                DOUBLE PRECISION,
+            -- ================================================
+            -- EXACT PRICE CHECKPOINTS
+            -- ================================================
 
-            price_30m
-                DOUBLE PRECISION,
+            price_30s DOUBLE PRECISION,
+            price_1m DOUBLE PRECISION,
+            price_5m DOUBLE PRECISION,
+            price_10m DOUBLE PRECISION,
+            price_30m DOUBLE PRECISION,
+            price_1h DOUBLE PRECISION,
+            price_4h DOUBLE PRECISION,
+            price_12h DOUBLE PRECISION,
+            price_24h DOUBLE PRECISION,
 
-            price_1h
-                DOUBLE PRECISION,
+            -- ================================================
+            -- DIRECTION-ADJUSTED RETURNS
+            --
+            -- Positive = predicted direction was profitable.
+            -- Negative = market moved against prediction.
+            -- ================================================
 
-            price_4h
-                DOUBLE PRECISION,
+            return_30s_pct DOUBLE PRECISION,
+            return_1m_pct DOUBLE PRECISION,
+            return_5m_pct DOUBLE PRECISION,
+            return_10m_pct DOUBLE PRECISION,
+            return_30m_pct DOUBLE PRECISION,
+            return_1h_pct DOUBLE PRECISION,
+            return_4h_pct DOUBLE PRECISION,
+            return_12h_pct DOUBLE PRECISION,
+            return_24h_pct DOUBLE PRECISION,
 
-            price_12h
-                DOUBLE PRECISION,
+            -- ================================================
+            -- WAS DIRECTION CORRECT?
+            -- ================================================
 
-            price_24h
-                DOUBLE PRECISION,
+            direction_correct_30s BOOLEAN,
+            direction_correct_1m BOOLEAN,
+            direction_correct_5m BOOLEAN,
+            direction_correct_10m BOOLEAN,
+            direction_correct_30m BOOLEAN,
+            direction_correct_1h BOOLEAN,
+            direction_correct_4h BOOLEAN,
+            direction_correct_12h BOOLEAN,
+            direction_correct_24h BOOLEAN,
 
-            return_10m_pct
-                DOUBLE PRECISION,
-
-            return_30m_pct
-                DOUBLE PRECISION,
-
-            return_1h_pct
-                DOUBLE PRECISION,
-
-            return_4h_pct
-                DOUBLE PRECISION,
-
-            return_12h_pct
-                DOUBLE PRECISION,
-
-            return_24h_pct
-                DOUBLE PRECISION,
+            -- ================================================
+            -- EXCURSION MEMORY
+            --
+            -- MFE = best move in predicted direction.
+            -- MAE = worst move against predicted direction.
+            -- ================================================
 
             max_favorable_excursion_pct
                 DOUBLE PRECISION,
@@ -317,26 +334,38 @@ def ensure_schema(conn):
             lowest_price
                 DOUBLE PRECISION,
 
-            direction_correct_10m
-                BOOLEAN,
+            -- ================================================
+            -- SHORT-TERM BEHAVIOUR
+            --
+            -- These fields help the future learning system
+            -- understand HOW a setup developed, rather than
+            -- only where price finished.
+            -- ================================================
 
-            direction_correct_30m
-                BOOLEAN,
+            immediate_move_pct
+                DOUBLE PRECISION,
 
-            direction_correct_1h
-                BOOLEAN,
+            early_momentum_pct
+                DOUBLE PRECISION,
 
-            direction_correct_4h
-                BOOLEAN,
+            momentum_5m_pct
+                DOUBLE PRECISION,
 
-            direction_correct_12h
-                BOOLEAN,
+            momentum_10m_pct
+                DOUBLE PRECISION,
 
-            direction_correct_24h
-                BOOLEAN,
+            momentum_30m_pct
+                DOUBLE PRECISION,
 
-            outcome_complete
-                BOOLEAN
+            early_reversal BOOLEAN,
+
+            early_continuation BOOLEAN,
+
+            -- ================================================
+            -- COMPLETION
+            -- ================================================
+
+            outcome_complete BOOLEAN
                 NOT NULL
                 DEFAULT FALSE,
 
@@ -346,12 +375,9 @@ def ensure_schema(conn):
         """
     )
 
-    # --------------------------------------------------------
-    # MARKET SNAPSHOT MEMORY
-    #
-    # Allows us to keep market conditions even when there
-    # was no qualifying signal.
-    # --------------------------------------------------------
+    # ========================================================
+    # MARKET SNAPSHOTS
+    # ========================================================
 
     cur.execute(
         """
@@ -397,12 +423,9 @@ def ensure_schema(conn):
         """
     )
 
-    # --------------------------------------------------------
-    # AI / MODEL VERSION HISTORY
-    #
-    # Important later when testing whether a new model
-    # actually improved results.
-    # --------------------------------------------------------
+    # ========================================================
+    # MODEL VERSION HISTORY
+    # ========================================================
 
     cur.execute(
         """
@@ -432,14 +455,15 @@ def ensure_schema(conn):
         """
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # INDEXES
-    # --------------------------------------------------------
+    # ========================================================
 
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS
         idx_signals2_opp_symbol_direction
+
         ON signals2_opportunities
         (symbol, direction)
         """
@@ -449,6 +473,7 @@ def ensure_schema(conn):
         """
         CREATE INDEX IF NOT EXISTS
         idx_signals2_opp_created
+
         ON signals2_opportunities
         (created_at DESC)
         """
@@ -458,6 +483,7 @@ def ensure_schema(conn):
         """
         CREATE INDEX IF NOT EXISTS
         idx_signals2_opp_decision
+
         ON signals2_opportunities
         (decision)
         """
@@ -467,6 +493,7 @@ def ensure_schema(conn):
         """
         CREATE INDEX IF NOT EXISTS
         idx_signals2_opp_confidence
+
         ON signals2_opportunities
         (final_confidence)
         """
@@ -476,6 +503,7 @@ def ensure_schema(conn):
         """
         CREATE INDEX IF NOT EXISTS
         idx_signals2_outcome_complete
+
         ON signals2_outcomes
         (outcome_complete)
         """
@@ -484,7 +512,18 @@ def ensure_schema(conn):
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS
+        idx_signals2_outcome_symbol
+
+        ON signals2_outcomes
+        (symbol, direction)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
         idx_signals2_market_created
+
         ON signals2_market_snapshots
         (created_at DESC)
         """
@@ -510,6 +549,12 @@ def initialize_database():
 
         print(
             "SIGNALS BOT 2.0 MEMORY DATABASE: READY",
+            flush=True,
+        )
+
+        print(
+            "MEMORY SCHEMA:",
+            MEMORY_SCHEMA_VERSION,
             flush=True,
         )
 
@@ -547,16 +592,20 @@ def store_opportunity(
 ):
 
     if created_at is None:
+
         created_at = utc_now()
 
     if isinstance(
         created_at,
         str,
     ):
+
         timestamp_for_id = (
             created_at
         )
+
     else:
+
         timestamp_for_id = (
             created_at.isoformat()
         )
@@ -610,7 +659,8 @@ def store_opportunity(
             ai_analysis,
 
             model_version,
-            strategy_version
+            strategy_version,
+            memory_schema_version
         )
 
         VALUES (
@@ -620,7 +670,7 @@ def store_opportunity(
             %s,%s,%s,
             %s::jsonb,%s::jsonb,%s::jsonb,
             %s::jsonb,%s::jsonb,%s::jsonb,
-            %s,%s
+            %s,%s,%s
         )
 
         ON CONFLICT (opportunity_id)
@@ -670,20 +720,18 @@ def store_opportunity(
 
             model_version,
             strategy_version,
+            MEMORY_SCHEMA_VERSION,
         ),
     )
 
-    # --------------------------------------------------------
-    # Every opportunity also gets an outcome record.
+    # ========================================================
+    # EVERY opportunity gets tracked.
     #
-    # Even rejected opportunities are tracked.
+    # This includes opportunities eventually rejected.
     #
-    # This is important because later we can discover:
-    #
-    # "The bot rejected this setup, but what actually happened?"
-    #
-    # That prevents selection bias.
-    # --------------------------------------------------------
+    # This is essential because otherwise the bot only learns
+    # from signals it chose to send and develops selection bias.
+    # ========================================================
 
     cur.execute(
         """
@@ -768,8 +816,7 @@ def store_market_snapshot(
 
     cur.execute(
         """
-        INSERT INTO
-        signals2_market_snapshots (
+        INSERT INTO signals2_market_snapshots (
 
             created_at,
             market_regime,
@@ -925,7 +972,7 @@ def update_final_decision(
 
 
 # ============================================================
-# GET ONE OPPORTUNITY
+# GET OPPORTUNITY
 # ============================================================
 
 
@@ -959,7 +1006,7 @@ def get_opportunity(
 
 
 # ============================================================
-# RECENT HISTORICAL OPPORTUNITIES
+# HISTORICAL MEMORY
 # ============================================================
 
 
@@ -1016,6 +1063,19 @@ def get_recent_opportunities(
 
             o.*,
 
+            r.price_30s,
+            r.price_1m,
+            r.price_5m,
+            r.price_10m,
+            r.price_30m,
+            r.price_1h,
+            r.price_4h,
+            r.price_12h,
+            r.price_24h,
+
+            r.return_30s_pct,
+            r.return_1m_pct,
+            r.return_5m_pct,
             r.return_10m_pct,
             r.return_30m_pct,
             r.return_1h_pct,
@@ -1023,15 +1083,30 @@ def get_recent_opportunities(
             r.return_12h_pct,
             r.return_24h_pct,
 
-            r.max_favorable_excursion_pct,
-            r.max_adverse_excursion_pct,
-
+            r.direction_correct_30s,
+            r.direction_correct_1m,
+            r.direction_correct_5m,
             r.direction_correct_10m,
             r.direction_correct_30m,
             r.direction_correct_1h,
             r.direction_correct_4h,
             r.direction_correct_12h,
             r.direction_correct_24h,
+
+            r.max_favorable_excursion_pct,
+            r.max_adverse_excursion_pct,
+
+            r.highest_price,
+            r.lowest_price,
+
+            r.immediate_move_pct,
+            r.early_momentum_pct,
+            r.momentum_5m_pct,
+            r.momentum_10m_pct,
+            r.momentum_30m_pct,
+
+            r.early_reversal,
+            r.early_continuation,
 
             r.outcome_complete
 
@@ -1078,7 +1153,7 @@ def get_recent_opportunities(
 
 
 # ============================================================
-# GET PENDING OUTCOMES
+# PENDING OUTCOMES
 # ============================================================
 
 
@@ -1135,6 +1210,9 @@ def update_outcome(
 
     allowed = {
 
+        "price_30s",
+        "price_1m",
+        "price_5m",
         "price_10m",
         "price_30m",
         "price_1h",
@@ -1142,6 +1220,9 @@ def update_outcome(
         "price_12h",
         "price_24h",
 
+        "return_30s_pct",
+        "return_1m_pct",
+        "return_5m_pct",
         "return_10m_pct",
         "return_30m_pct",
         "return_1h_pct",
@@ -1149,18 +1230,30 @@ def update_outcome(
         "return_12h_pct",
         "return_24h_pct",
 
-        "max_favorable_excursion_pct",
-        "max_adverse_excursion_pct",
-
-        "highest_price",
-        "lowest_price",
-
+        "direction_correct_30s",
+        "direction_correct_1m",
+        "direction_correct_5m",
         "direction_correct_10m",
         "direction_correct_30m",
         "direction_correct_1h",
         "direction_correct_4h",
         "direction_correct_12h",
         "direction_correct_24h",
+
+        "max_favorable_excursion_pct",
+        "max_adverse_excursion_pct",
+
+        "highest_price",
+        "lowest_price",
+
+        "immediate_move_pct",
+        "early_momentum_pct",
+        "momentum_5m_pct",
+        "momentum_10m_pct",
+        "momentum_30m_pct",
+
+        "early_reversal",
+        "early_continuation",
 
         "outcome_complete",
     }
@@ -1221,7 +1314,7 @@ def update_outcome(
 
 
 # ============================================================
-# MARK OUTCOME COMPLETE
+# COMPLETE OUTCOME
 # ============================================================
 
 
@@ -1339,7 +1432,9 @@ def register_model_version(
 # ============================================================
 
 
-def memory_statistics(conn):
+def memory_statistics(
+    conn,
+):
 
     cur = conn.cursor(
         cursor_factory=RealDictCursor
@@ -1371,7 +1466,9 @@ def memory_statistics(conn):
         """
     )
 
-    result = cur.fetchone()
+    result = (
+        cur.fetchone()
+    )
 
     return (
         dict(result)
@@ -1389,27 +1486,57 @@ if __name__ == "__main__":
 
     print(
         "BRAD'S SIGNALS BOT 2.0 "
-        "- LONG-TERM MEMORY ENGINE",
+        "- LONG-TERM MEMORY ENGINE V2",
         flush=True,
     )
 
     print(
-        "EVERY OPPORTUNITY MEMORY: READY",
+        "30 SECOND MEMORY: READY",
         flush=True,
     )
 
     print(
-        "REJECTED SETUP MEMORY: READY",
+        "1 MINUTE MEMORY: READY",
         flush=True,
     )
 
     print(
-        "MULTI-HORIZON OUTCOME MEMORY: READY",
+        "5 MINUTE MEMORY: READY",
         flush=True,
     )
 
     print(
-        "MODEL VERSION HISTORY: READY",
+        "10 MINUTE MEMORY: READY",
+        flush=True,
+    )
+
+    print(
+        "30 MINUTE MEMORY: READY",
+        flush=True,
+    )
+
+    print(
+        "1H / 4H / 12H / 24H MEMORY: READY",
+        flush=True,
+    )
+
+    print(
+        "MFE / MAE MEMORY: READY",
+        flush=True,
+    )
+
+    print(
+        "EARLY MOMENTUM / REVERSAL MEMORY: READY",
+        flush=True,
+    )
+
+    print(
+        "REJECTED OPPORTUNITY MEMORY: READY",
+        flush=True,
+    )
+
+    print(
+        "MODEL VERSIONING: READY",
         flush=True,
     )
 
