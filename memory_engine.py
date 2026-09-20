@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import math
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
@@ -591,9 +592,23 @@ def store_opportunity(
     created_at=None,
 ):
 
+    # Invalid observations must never enter the learning database.
+    symbol = str(symbol).strip().upper()
+    direction = str(direction).strip().upper()
+    if not symbol or direction not in ("LONG", "SHORT"):
+        raise ValueError("A valid symbol and LONG/SHORT direction are required")
+    entry_price = float(entry_price)
+    if not math.isfinite(entry_price) or entry_price <= 0:
+        raise ValueError("A finite, positive entry price is required")
+
     if created_at is None:
 
         created_at = utc_now()
+    elif isinstance(created_at, str):
+        created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    created_at = created_at.astimezone(timezone.utc)
 
     if isinstance(
         created_at,
@@ -1265,11 +1280,15 @@ def update_outcome(
         fields.items()
     ):
 
-        if key not in allowed:
+        if key not in allowed or value is None:
             continue
-
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        # Keep the first recorded checkpoint. A later re-run must not
+        # silently rewrite history with a different candle or quote.
         updates.append(
-            f"{key} = %s"
+            f"{key} = COALESCE({key}, %s)" if key != "outcome_complete"
+            else "outcome_complete = outcome_complete OR %s"
         )
 
         params.append(
@@ -1323,13 +1342,22 @@ def mark_outcome_complete(
     opportunity_id: str,
 ):
 
-    update_outcome(
-        conn,
-        opportunity_id,
-        outcome_complete=True,
-    )
-
     cur = conn.cursor()
+    cur.execute("""
+        SELECT price_1m, price_5m, price_10m, price_30m,
+               price_1h, price_4h, price_12h, price_24h
+        FROM signals2_outcomes WHERE opportunity_id = %s
+        FOR UPDATE
+    """, (opportunity_id,))
+    row = cur.fetchone()
+    if row is None or any(value is None for value in row):
+        raise ValueError("Cannot complete an outcome with missing checkpoints")
+    cur.execute("""
+        UPDATE signals2_outcomes
+        SET outcome_complete = TRUE, last_updated = %s
+        WHERE opportunity_id = %s
+    """, (utc_now(), opportunity_id))
+
 
     cur.execute(
         """
@@ -1531,12 +1559,12 @@ if __name__ == "__main__":
     )
 
     print(
-        "REJECTED OPPORTUNITY MEMORY: READY",
+        "UNSENT OPPORTUNITY MEMORY: SCHEMA DEFINED",
         flush=True,
     )
 
     print(
-        "MODEL VERSIONING: READY",
+        "MODEL VERSIONING: SCHEMA DEFINED",
         flush=True,
     )
 
