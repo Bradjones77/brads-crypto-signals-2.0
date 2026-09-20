@@ -4,6 +4,7 @@ import hmac
 import base64
 import hashlib
 import json
+import math
 from typing import Dict, List, Optional, Any
 
 import requests
@@ -530,6 +531,54 @@ VALID_GRANULARITIES = {
 }
 
 
+# Candle lengths in milliseconds. Weekly/3-day candles are intentionally not
+# accepted by the strict freshness check until their exchange boundaries are
+# explicitly verified. No guesswork about a still-forming candle.
+_CANDLE_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000,
+    "15m": 900_000, "30m": 1_800_000,
+    "1H": 3_600_000, "4H": 14_400_000,
+    "6H": 21_600_000, "12H": 43_200_000,
+    "1D": 86_400_000,
+}
+
+
+def _validate_closed_candles(candles, granularity, now_ms, limit):
+    """Fail closed on malformed, incomplete, duplicate or stale market data."""
+    duration = _CANDLE_MS.get(granularity)
+    if duration is None:
+        raise ValueError(f"Closed-candle validation unsupported: {granularity}")
+    valid = []
+    seen = set()
+    for candle in candles:
+        stamp = candle["timestamp"]
+        if stamp in seen:
+            raise ValueError("Duplicate candle timestamp")
+        seen.add(stamp)
+        if stamp < 0 or stamp > now_ms + duration:
+            raise ValueError("Invalid or future candle timestamp")
+        values = [candle[k] for k in ("open", "high", "low", "close", "volume_base")]
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError("Non-finite candle value")
+        op, hi, lo, cl, vol = values
+        if min(op, hi, lo, cl) <= 0 or vol < 0 or hi < max(op, cl) or lo > min(op, cl):
+            raise ValueError("Invalid OHLCV candle")
+        quote = candle.get("volume_quote")
+        if quote is not None and (not math.isfinite(quote) or quote < 0):
+            raise ValueError("Invalid quote volume")
+        if stamp + duration <= now_ms:
+            valid.append(candle)
+    if not valid:
+        raise ValueError("No fully closed candles")
+    # The most recent closed candle must belong to the immediately prior period.
+    # Reject missing or delayed updates instead of scoring old prices.
+    if now_ms - (valid[-1]["timestamp"] + duration) >= duration:
+        raise ValueError("Stale candle data")
+    if any(b["timestamp"] - a["timestamp"] != duration for a, b in zip(valid, valid[1:])):
+        raise ValueError("Gap in candle history")
+    return valid[-limit:]
+
+
 def get_candles(
     symbol: str,
     granularity: str,
@@ -585,7 +634,7 @@ def get_candles(
             granularity,
 
             "limit":
-            limit,
+            min(limit + 1, 1000),
         },
     )
 
@@ -593,7 +642,7 @@ def get_candles(
         data,
         list,
     ):
-        return []
+        raise ValueError("Missing Bitget candle data")
 
     candles = []
 
@@ -649,7 +698,7 @@ def get_candles(
         x["timestamp"]
     )
 
-    return candles
+    return _validate_closed_candles(candles, granularity, int(time.time() * 1000), limit)
 
 
 # ============================================================
