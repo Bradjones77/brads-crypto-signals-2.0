@@ -46,7 +46,7 @@ from typing import Dict, Any, Optional
 # ============================================================
 
 
-CONFIDENCE_ENGINE_VERSION = "signals2-confidence-v1"
+CONFIDENCE_ENGINE_VERSION = "signals2-confidence-v1.1"
 
 SIGNAL_THRESHOLD = 75.0
 
@@ -133,11 +133,12 @@ def normalize_score(
 
         return None
 
-    return clamp(
-        value,
-        0.0,
-        100.0,
-    )
+    # Reject invalid scores rather than turning 150 or -20 into
+    # apparently valid evidence. The scale must be documented 0-100.
+    if value < 0.0 or value > 100.0:
+        return None
+
+    return value
 
 
 # ============================================================
@@ -337,7 +338,7 @@ def calculate_technical_confidence(
         )
     )
 
-    if direct_score is not None:
+    if normalize_score(direct_score) is not None:
 
         return {
 
@@ -1565,48 +1566,30 @@ def calculate_conflict_penalty(
 
     conflicts = []
 
-    conflicts.extend(
-        technical_result.get(
-            "conflicting_factors",
-            [],
-        )
-    )
+    technical_conflicts = technical_result.get("conflicting_factors", [])
+    if isinstance(technical_conflicts, list):
+        conflicts.extend(technical_conflicts)
 
-    conflicts.extend(
-        market_result.get(
-            "conflicting_factors",
-            [],
-        )
-    )
+    market_conflicts = market_result.get("conflicting_factors", [])
+    if isinstance(market_conflicts, list):
+        conflicts.extend(market_conflicts)
 
     if isinstance(
         ai_result,
         dict,
     ):
 
-        conflicts.extend(
-            ai_result.get(
-                "technical_conflicts",
-                [],
-            )
-            or []
-        )
+        ai_conflicts = ai_result.get("technical_conflicts", [])
+        if isinstance(ai_conflicts, list):
+            conflicts.extend(ai_conflicts[:5])
 
-        conflicts.extend(
-            ai_result.get(
-                "market_conflicts",
-                [],
-            )
-            or []
-        )
+        ai_conflicts = ai_result.get("market_conflicts", [])
+        if isinstance(ai_conflicts, list):
+            conflicts.extend(ai_conflicts[:5])
 
-        conflicts.extend(
-            ai_result.get(
-                "historical_warning_points",
-                [],
-            )
-            or []
-        )
+        ai_conflicts = ai_result.get("historical_warning_points", [])
+        if isinstance(ai_conflicts, list):
+            conflicts.extend(ai_conflicts[:5])
 
     # Remove duplicates.
 
@@ -1715,7 +1698,7 @@ def calculate_overall_data_quality(
             1.0,
         )
 
-        if score is None:
+        if normalize_score(score) is None or quality <= 0:
 
             continue
 
@@ -1732,9 +1715,11 @@ def calculate_overall_data_quality(
 
         return 0.0
 
+    # Divide by ALL configured weight, not just the available
+    # components. Missing memory/AI must not look like full coverage.
     return clamp(
         weighted_quality
-        / total_weight,
+        / sum(BASE_WEIGHTS.values()),
         0.0,
         1.0,
     )
@@ -1972,13 +1957,22 @@ def evaluate_evidence_gates(
         )
     )
 
-    # Technical evidence is mandatory.
-
+    # A valid direction and both technical and market evidence are
+    # mandatory. A lone high component cannot qualify a signal.
     if technical_score is None:
 
         reasons.append(
             "No usable technical evidence"
         )
+
+    if market_score is None:
+        reasons.append("No usable market evidence")
+
+    if technical.get("quality", 0.0) < 0.40:
+        reasons.append("Insufficient technical evidence coverage")
+
+    if market.get("quality", 0.0) < 0.50:
+        reasons.append("Insufficient market evidence coverage")
 
     # Extremely weak technical evidence blocks eligibility.
 
@@ -2210,6 +2204,10 @@ def calculate_final_confidence(
         )
     )
 
+    if direction == "UNKNOWN":
+        gates["reasons"].append("Invalid LONG/SHORT direction")
+        gates["passed"] = False
+
     # --------------------------------------------------------
     # HARD 75 CONFIDENCE RULE
     # --------------------------------------------------------
@@ -2433,8 +2431,14 @@ def signal_is_eligible(
 
         return False
 
-    if confidence < SIGNAL_THRESHOLD:
+    if confidence < SIGNAL_THRESHOLD or confidence > 100.0:
 
+        return False
+
+    if confidence_result.get("decision") != "ELIGIBLE":
+        return False
+
+    if not (confidence_result.get("evidence_gates") or {}).get("passed", False):
         return False
 
     return bool(
