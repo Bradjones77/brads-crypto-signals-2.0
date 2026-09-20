@@ -1,4 +1,5 @@
 import time
+import math
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
@@ -450,34 +451,26 @@ def historical_price_at_horizon(
     opportunity_timestamp: float,
     horizon_seconds: int,
 ) -> Optional[float]:
+    """Use a completed 1m candle only when its close is close to the target.
 
-    target_timestamp = (
-        opportunity_timestamp
-        + horizon_seconds
-    )
-
-    candle = (
-        find_first_candle_at_or_after(
-            candles,
-            target_timestamp,
-        )
-    )
-
-    if not candle:
-
-        return None
-
-    try:
-
-        return float(
-            candle[
-                "close"
-            ]
-        )
-
-    except Exception:
-
-        return None
+    Candle timestamps mark the OPEN, not the CLOSE. Never substitute a
+    5m/15m candle close for an exact 1m/5m checkpoint.
+    """
+    target = opportunity_timestamp + horizon_seconds
+    candidates = []
+    for candle in candles:
+        ts = candle_timestamp_seconds(candle)
+        if ts is None:
+            continue
+        close_time = ts + 60
+        if target <= close_time <= target + 60:
+            try:
+                price = float(candle["close"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            if math.isfinite(price) and price > 0:
+                candidates.append((close_time, price))
+    return min(candidates)[1] if candidates else None
 
 
 # ============================================================
@@ -541,10 +534,10 @@ def calculate_excursions(
 
             continue
 
+        # Include only complete 1m candles wholly inside the window.
         if not (
-            start_timestamp
-            <= ts
-            <= end_timestamp
+            start_timestamp <= ts
+            and ts + 60 <= end_timestamp
         ):
 
             continue
@@ -883,6 +876,8 @@ def calculate_outcome_fields(
     # Exact 30-second price should come from a live observation.
     # ========================================================
 
+    # Historical checkpoint prices require 1m candles. Larger candles
+    # are not exact observations at the requested horizon.
     historical_horizons = [
 
         "1m",
@@ -967,7 +962,16 @@ def calculate_outcome_fields(
         ],
     )
 
-    if available_horizon >= 60:
+    # Do not report full-window MFE/MAE from partial history.
+    earliest = min((candle_timestamp_seconds(c) for c in candles
+                    if candle_timestamp_seconds(c) is not None), default=None)
+    latest = max((candle_timestamp_seconds(c) for c in candles
+                  if candle_timestamp_seconds(c) is not None), default=None)
+    full_window = (earliest is not None and latest is not None
+                   and earliest >= opportunity_timestamp
+                   and earliest < opportunity_timestamp + 60
+                   and latest + 60 >= opportunity_timestamp + available_horizon)
+    if available_horizon >= 60 and full_window:
 
         excursions = (
             calculate_excursions(
@@ -1218,7 +1222,7 @@ def update_one_outcome(
 
     # Historical candle processing begins after 1 minute.
 
-    if age_seconds < 60:
+    if age_seconds < 120:
 
         return {
             "opportunity_id":
@@ -1231,18 +1235,11 @@ def update_one_outcome(
             "Waiting for first historical candle",
         }
 
-    granularity = (
-        choose_tracking_granularity(
-            age_seconds
-        )
-    )
-
-    limit = (
-        calculate_required_limit(
-            age_seconds,
-            granularity,
-        )
-    )
+    # Fetch the most recent 1m candles only. Bitget's 1000-candle
+    # limit means older checkpoints must remain missing rather than
+    # being fabricated from coarser candles.
+    granularity = "1m"
+    limit = 1000
 
     candles = (
         get_candles(
@@ -1265,6 +1262,8 @@ def update_one_outcome(
             "No candle data",
         }
 
+    # Reject incomplete history and avoid deriving excursions from
+    # a truncated window. Checkpoints can still be stored independently.
     fields = (
         calculate_outcome_fields(
             opportunity=opportunity,
