@@ -62,6 +62,10 @@ VERY_STRONG_SAMPLE_SIZE = 75
 
 MIN_SIMILARITY = 0.45
 
+# Require actual overlap; two coincidental indicators are not evidence.
+MIN_MATCHED_FEATURES = 5
+MIN_FEATURE_COVERAGE = 0.15
+
 
 # ============================================================
 # OUTCOME IMPORTANCE
@@ -819,15 +823,14 @@ def direction_compatibility(
         .strip()
     )
 
-    if current == historical:
+    if current == historical and current in ("LONG", "SHORT"):
 
         return 1.0
 
-    # Opposite-direction historical examples can still
-    # contain useful information, but receive a large
-    # penalty.
-
-    return 0.35
+    # Returns are direction-adjusted for the HISTORICAL trade.
+    # Mixing opposite directions without transforming their outcomes
+    # would falsely turn an opposite-direction win into supporting evidence.
+    return 0.0
 
 
 # ============================================================
@@ -958,7 +961,9 @@ def fetch_historical_candidates(
 
     if before_time is None:
 
-        before_time = utc_now()
+        # Invalid timestamps must not silently turn a historical
+        # backtest into a query against the current database.
+        return []
 
     start_time = (
         before_time
@@ -1048,6 +1053,11 @@ def fetch_historical_candidates(
 
             AND o.created_at >= %s
 
+            -- A 24h outcome must already have existed at the
+            -- evaluation timestamp, not merely exist today.
+            AND r.opportunity_time + INTERVAL '24 hours' <= %s
+            AND r.last_updated <= %s
+
         ORDER BY
             o.created_at DESC
 
@@ -1057,6 +1067,8 @@ def fetch_historical_candidates(
         (
             before_time,
             start_time,
+            before_time,
+            before_time,
             safe_limit,
         ),
     )
@@ -1139,7 +1151,11 @@ def score_historical_match(
         ]
     )
 
-    if similarity < MIN_SIMILARITY:
+    if (
+        similarity < MIN_SIMILARITY
+        or similarity_result["matched_features"] < MIN_MATCHED_FEATURES
+        or similarity_result["feature_coverage"] < MIN_FEATURE_COVERAGE
+    ):
 
         return None
 
@@ -1964,7 +1980,10 @@ def calculate_memory_evidence_score(
             0.0,
         )
 
-        if accuracy is None:
+        if (
+            accuracy is None
+            or effective_n < MIN_MATCHES_FOR_MEMORY_SCORE
+        ):
 
             continue
 
