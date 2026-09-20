@@ -1,4 +1,8 @@
 import time
+import os
+import json
+import urllib.request
+import urllib.error
 import traceback
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
@@ -1179,6 +1183,51 @@ def development_self_test():
 
 
 # ============================================================
+# EXPLICIT TELEGRAM CONNECTION TEST ONLY
+# This does not enable market scanning or signal delivery.
+# Set SIGNALS2_TELEGRAM_TEST_ON_START=true for ONE deployment,
+# then remove/reset it to avoid another message on restart.
+# ============================================================
+
+
+def send_telegram_connection_test():
+    token = os.environ.get("SIGNALS2_TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("SIGNALS2_TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("TELEGRAM TEST: missing token or chat ID", flush=True)
+        return False
+    if not chat_id.lstrip("-").isdigit():
+        print("TELEGRAM TEST: invalid chat ID", flush=True)
+        return False
+
+    payload = json.dumps({
+        "chat_id": chat_id,
+        "text": "Signals Bot 2.0: Telegram connection test successful. "
+                "This is NOT a trading signal. Live scanning and signal sending remain disabled.",
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.telegram.org/bot" + token + "/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            result = json.loads(response.read(65536).decode("utf-8"))
+        if result.get("ok") is True:
+            print("TELEGRAM TEST: message sent successfully", flush=True)
+            return True
+        print("TELEGRAM TEST: Telegram rejected the message", flush=True)
+    except urllib.error.HTTPError as exc:
+        # Do not print response body or URL: URL contains the secret token.
+        print("TELEGRAM TEST: HTTP error status", exc.code, flush=True)
+    except Exception as exc:
+        # Avoid printing exception text, which can contain the token URL.
+        print("TELEGRAM TEST: connection failed (" + type(exc).__name__ + ")", flush=True)
+    return False
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1188,6 +1237,9 @@ if __name__ == "__main__":
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_TELEGRAM_TEST_ON_START", "").lower().strip() == "true":
+            send_telegram_connection_test()
 
     except KeyboardInterrupt:
 
