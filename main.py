@@ -321,7 +321,8 @@ def run_technical_stage(
 
         result = (
             technical_analysis.analyze_symbol(
-                multi_timeframe_candles
+                symbol=opportunity["symbol"],
+                multi_timeframe_candles=multi_timeframe_candles
             )
         )
 
@@ -1240,6 +1241,37 @@ if __name__ == "__main__":
 
         if os.environ.get("SIGNALS2_TELEGRAM_TEST_ON_START", "").lower().strip() == "true":
             send_telegram_connection_test()
+
+        # One-shot technical-analysis diagnostic; never sends signals or trades.
+        if os.environ.get("SIGNALS2_TECHNICAL_TEST_ON_START", "").lower().strip() == "true":
+            print("TECHNICAL DIAGNOSTIC: starting BTCUSDT read-only analysis", flush=True)
+            if bitget_market is None or technical_analysis is None:
+                print("TECHNICAL DIAGNOSTIC: FAIL (module unavailable)", flush=True)
+            else:
+                try:
+                    frames = ("5m", "15m", "30m", "1H", "4H", "1D")
+                    candles = bitget_market.get_multi_timeframe_candles(
+                        symbol="BTCUSDT", timeframes=frames, limit=200
+                    )
+                    counts = {frame: len(candles.get(frame, [])) for frame in frames}
+                    print("TECHNICAL DIAGNOSTIC: candle counts " + str(counts), flush=True)
+                    if any(counts[frame] < 55 for frame in frames):
+                        raise ValueError("Missing or insufficient closed candle history")
+                    analysis = technical_analysis.analyze_symbol(
+                        symbol="BTCUSDT", multi_timeframe_candles=candles
+                    )
+                    timeframe_results = analysis.get("timeframes", {})
+                    valid = {frame: bool(timeframe_results.get(frame, {}).get("valid")) for frame in frames}
+                    alignment = analysis.get("multi_timeframe", {})
+                    print("TECHNICAL DIAGNOSTIC: valid timeframes " + str(valid), flush=True)
+                    print("TECHNICAL DIAGNOSTIC: alignment " + str(alignment.get("overall")), flush=True)
+                    if not all(valid.values()) or alignment.get("valid_timeframes") != len(frames):
+                        raise ValueError("Technical analysis did not validate all timeframes")
+                    if analysis.get("price") is None:
+                        raise ValueError("No analyzed price")
+                    print("TECHNICAL DIAGNOSTIC: PASS", flush=True)
+                except Exception as exc:
+                    print("TECHNICAL DIAGNOSTIC: FAIL (" + type(exc).__name__ + ")", flush=True)
 
         # One-shot read-only market data diagnostic. Does not scan continuously,
         # calculate signals, send Telegram messages, or place trades.
