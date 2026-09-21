@@ -1241,6 +1241,21 @@ if __name__ == "__main__":
         if os.environ.get("SIGNALS2_TELEGRAM_TEST_ON_START", "").lower().strip() == "true":
             send_telegram_connection_test()
 
+        # One-shot read-only market data diagnostic. Does not scan continuously,
+        # calculate signals, send Telegram messages, or place trades.
+        if os.environ.get("SIGNALS2_BITGET_TEST_ON_START", "").lower().strip() == "true":
+            print("BITGET DIAGNOSTIC: starting public read-only test", flush=True)
+            if bitget_market is None:
+                print("BITGET DIAGNOSTIC: module unavailable", flush=True)
+            else:
+                try:
+                    passed = bitget_market.bitget_public_self_test()
+                    print("BITGET DIAGNOSTIC: " + ("PASS" if passed else "FAIL"), flush=True)
+                except Exception as exc:
+                    # Avoid dumping request URLs or private credentials into logs.
+                    print("BITGET DIAGNOSTIC: FAIL (" + type(exc).__name__ + ")", flush=True)
+
+
     except KeyboardInterrupt:
 
         print(
