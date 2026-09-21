@@ -1336,6 +1336,64 @@ if __name__ == "__main__":
                 except Exception as exc:
                     print("CONFIDENCE DIAGNOSTIC: FAIL (" + type(exc).__name__ + ": " + str(exc) + ")", flush=True)
 
+        # One-shot selector diagnostic: synthetic opportunities only; no messages or trades.
+        if os.environ.get("SIGNALS2_SELECTOR_TEST_ON_START", "").lower().strip() == "true":
+            print("SELECTOR DIAGNOSTIC: starting synthetic safety checks", flush=True)
+            if signal_selector is None:
+                print("SELECTOR DIAGNOSTIC: FAIL (module unavailable)", flush=True)
+            else:
+                try:
+                    from datetime import timedelta
+                    now = utc_now()
+
+                    def sample(symbol="BTCUSDT", direction="LONG", score=75.0,
+                               eligible=True, decision="ELIGIBLE", gate_passed=True,
+                               observed_at=None):
+                        return {
+                            "symbol": symbol, "direction": direction,
+                            "current_price": 100.0,
+                            "observed_at": now if observed_at is None else observed_at,
+                            "confidence_result": {
+                                "final_confidence": score, "eligible": eligible,
+                                "decision": decision,
+                                "evidence_gates": {"passed": gate_passed,
+                                                   "reasons": [] if gate_passed else ["Synthetic gate failure"]},
+                            },
+                        }
+
+                    checks = []
+                    def check(name, condition):
+                        checks.append((name, bool(condition)))
+                        print("SELECTOR DIAGNOSTIC: " + name + " " +
+                              ("PASS" if condition else "FAIL"), flush=True)
+
+                    evaluate = signal_selector.evaluate_opportunity
+                    check("below 75 rejected", not evaluate(sample(score=74.99), now=now)["selected"])
+                    check("exactly 75 eligible", evaluate(sample(score=75.0), now=now)["selected"])
+                    check("engine ineligible rejected", not evaluate(sample(eligible=False), now=now)["selected"])
+                    check("contradictory decision rejected", not evaluate(sample(decision="REJECTED"), now=now)["selected"])
+                    check("failed evidence gate rejected", not evaluate(sample(gate_passed=False), now=now)["selected"])
+                    missing = sample()
+                    missing.pop("observed_at")
+                    check("missing timestamp rejected", not evaluate(missing, now=now)["selected"])
+                    check("stale opportunity rejected", not evaluate(
+                        sample(observed_at=now - timedelta(seconds=181)), now=now)["selected"])
+                    check("cooldown rejected", not evaluate(
+                        sample(), recent_signal_times={"BTCUSDT:LONG": now}, now=now)["selected"])
+                    batch = signal_selector.select_signals(
+                        [sample(score=76), sample(score=80)], now=now)
+                    check("same-batch duplicate rejected", batch["selected_count"] == 1 and
+                          batch["rejected_count"] == 1 and
+                          batch["selected"][0]["confidence_result"]["final_confidence"] == 80)
+                    check("opposite directions distinct", signal_selector.select_signals(
+                        [sample(direction="LONG"), sample(direction="SHORT")], now=now)["selected_count"] == 2)
+                    passed = sum(result for _, result in checks)
+                    print("SELECTOR DIAGNOSTIC: " + ("PASS" if passed == len(checks) else "FAIL") +
+                          " (" + str(passed) + "/" + str(len(checks)) +
+                          "; synthetic only; no signal sent)", flush=True)
+                except Exception as exc:
+                    print("SELECTOR DIAGNOSTIC: FAIL (" + type(exc).__name__ + ": " + str(exc) + ")", flush=True)
+
         # One-shot read-only market data diagnostic. Does not scan continuously,
         # calculate signals, send Telegram messages, or place trades.
         if os.environ.get("SIGNALS2_BITGET_TEST_ON_START", "").lower().strip() == "true":
