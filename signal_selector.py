@@ -487,16 +487,17 @@ def passes_confidence_gate(
                       "Confidence engine decision is not ELIGIBLE",
         }
 
-    gate_reasons = confidence_result.get("gate_reasons")
-    if gate_reasons is None:
-        gate_reasons = []
-    if not isinstance(gate_reasons, list) or gate_reasons:
+    # The confidence engine nests gate status under evidence_gates.
+    # Require explicit passed=True; missing or malformed evidence fails closed.
+    gates = confidence_result.get("evidence_gates")
+    if not isinstance(gates, dict) or gates.get("passed") is not True:
+        reasons = gates.get("reasons") if isinstance(gates, dict) else None
         return {
             "passed": False,
             "confidence": confidence,
-            "reason": "; ".join(str(reason) for reason in gate_reasons)
-                      if isinstance(gate_reasons, list) and gate_reasons
-                      else "Confidence evidence gates are invalid",
+            "reason": "; ".join(str(reason) for reason in reasons)
+                      if isinstance(reasons, list) and reasons
+                      else "Confidence evidence gates did not pass",
         }
 
     return {
