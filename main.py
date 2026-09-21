@@ -1273,6 +1273,69 @@ if __name__ == "__main__":
                 except Exception as exc:
                     print("TECHNICAL DIAGNOSTIC: FAIL (" + type(exc).__name__ + ")", flush=True)
 
+        # One-shot confidence diagnostic: public candles only; no signals or trades.
+        if os.environ.get("SIGNALS2_CONFIDENCE_TEST_ON_START", "").lower().strip() == "true":
+            print("CONFIDENCE DIAGNOSTIC: starting read-only BTC/ETH analysis", flush=True)
+            if any(module is None for module in (bitget_market, technical_analysis, market_context, confidence_engine)):
+                print("CONFIDENCE DIAGNOSTIC: FAIL (required module unavailable)", flush=True)
+            else:
+                try:
+                    frames = ("5m", "15m", "30m", "1H", "4H", "1D")
+                    analyses = {}
+                    for symbol in ("BTCUSDT", "ETHUSDT"):
+                        candles = bitget_market.get_multi_timeframe_candles(
+                            symbol=symbol, timeframes=frames, limit=200
+                        )
+                        counts = {frame: len(candles.get(frame, [])) for frame in frames}
+                        print("CONFIDENCE DIAGNOSTIC: " + symbol + " candle counts " + str(counts), flush=True)
+                        if any(count < 55 for count in counts.values()):
+                            raise ValueError(symbol + " insufficient candle history")
+                        analysis = technical_analysis.analyze_symbol(
+                            symbol=symbol, multi_timeframe_candles=candles
+                        )
+                        if not all(analysis.get("timeframes", {}).get(frame, {}).get("valid") for frame in frames):
+                            raise ValueError(symbol + " invalid timeframe analysis")
+                        analyses[symbol] = analysis
+                    full_context = market_context.build_market_context(
+                        btc_analysis=analyses["BTCUSDT"],
+                        eth_analysis=analyses["ETHUSDT"],
+                        all_symbol_analyses=list(analyses.values()),
+                    )
+                    for direction in ("LONG", "SHORT"):
+                        coin_context = market_context.build_coin_market_context(
+                            coin_analysis=analyses["BTCUSDT"],
+                            btc_analysis=analyses["BTCUSDT"],
+                            market_context=full_context,
+                            direction=direction,
+                        )
+                        result = confidence_engine.calculate_final_confidence(
+                            symbol="BTCUSDT", direction=direction,
+                            technical_analysis=analyses["BTCUSDT"],
+                            market_context=coin_context,
+                            memory_analysis={"memory_usable": False},
+                            ai_result={"available": False},
+                        )
+                        print("CONFIDENCE DIAGNOSTIC: " + direction + " " + json.dumps({
+                            "score": result.get("final_confidence"),
+                            "decision": result.get("decision"),
+                            "eligible": result.get("eligible"),
+                            "components": result.get("component_scores"),
+                            "quality": result.get("component_quality"),
+                            "gate_reasons": result.get("evidence_gates", {}).get("reasons"),
+                            "rejection_reason": result.get("rejection_reason"),
+                        }, default=str), flush=True)
+                        if result.get("component_scores", {}).get("technical") is None:
+                            raise ValueError("No technical score for " + direction)
+                        if result.get("component_scores", {}).get("market") is None:
+                            raise ValueError("No market score for " + direction)
+                        if result.get("eligible") != confidence_engine.signal_is_eligible(result):
+                            raise ValueError("Eligibility mismatch for " + direction)
+                        if result.get("eligible") and result.get("final_confidence", 0) < 75.0:
+                            raise ValueError("Threshold violation for " + direction)
+                    print("CONFIDENCE DIAGNOSTIC: PASS (calculation only; no signal sent)", flush=True)
+                except Exception as exc:
+                    print("CONFIDENCE DIAGNOSTIC: FAIL (" + type(exc).__name__ + ": " + str(exc) + ")", flush=True)
+
         # One-shot read-only market data diagnostic. Does not scan continuously,
         # calculate signals, send Telegram messages, or place trades.
         if os.environ.get("SIGNALS2_BITGET_TEST_ON_START", "").lower().strip() == "true":
