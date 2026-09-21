@@ -46,7 +46,7 @@ from typing import Dict, Any, Optional
 # ============================================================
 
 
-CONFIDENCE_ENGINE_VERSION = "signals2-confidence-v1.1"
+CONFIDENCE_ENGINE_VERSION = "signals2-confidence-v1.2"
 
 SIGNAL_THRESHOLD = 75.0
 
@@ -324,40 +324,15 @@ def calculate_technical_confidence(
             "conflicting_factors": [],
         }
 
-    # --------------------------------------------------------
-    # DIRECT SCORE
-    # --------------------------------------------------------
-
-    direct_score = (
-        find_numeric_value(
-            technical_analysis,
-            [
-                "technical_confidence",
-                "technical_score",
-            ],
-        )
-    )
-
-    if normalize_score(direct_score) is not None:
-
-        return {
-
-            "score":
-            normalize_score(
-                direct_score
-            ),
-
-            "quality":
-            1.0,
-
-            "supporting_factors":
-            [
-                "Technical engine supplied direct score"
-            ],
-
-            "conflicting_factors":
-            [],
-        }
+    # Only a documented, top-level directional score is accepted.
+    # Recursive lookup could accidentally pick a score for another timeframe.
+    direct_score = normalize_score(technical_analysis.get("technical_confidence"))
+    if direct_score is None:
+        direct_score = normalize_score(technical_analysis.get("technical_score"))
+    if direct_score is not None:
+        return {"score": direct_score, "quality": 1.0,
+                "supporting_factors": ["Technical engine supplied direct score"],
+                "conflicting_factors": []}
 
     sign = (
         direction_sign(
@@ -375,16 +350,9 @@ def calculate_technical_confidence(
     # MULTI-TIMEFRAME ALIGNMENT
     # --------------------------------------------------------
 
-    alignment = (
-        find_numeric_value(
-            technical_analysis,
-            [
-                "overall_alignment",
-                "alignment_score",
-                "mtf_alignment",
-            ],
-        )
-    )
+    alignment = safe_float((technical_analysis.get("multi_timeframe") or {}).get("alignment_score"))
+    if alignment is None:
+        alignment = safe_float(technical_analysis.get("alignment_score"))
 
     if alignment is not None:
 
@@ -474,13 +442,7 @@ def calculate_technical_confidence(
         timeframe_weights.items()
     ):
 
-        tf = (
-            timeframes.get(
-                timeframe,
-                {}
-            )
-            or {}
-        )
+        tf = (timeframes.get(timeframe) or timeframes.get(timeframe.upper()) or {})
 
         if not isinstance(
             tf,
@@ -489,18 +451,12 @@ def calculate_technical_confidence(
 
             continue
 
-        trend = (
-            str(
-                tf.get(
-                    "trend",
-                    tf.get(
-                        "trend_state",
-                        "",
-                    ),
-                )
-            )
-            .upper()
-        )
+        if tf.get("valid") is False:
+            continue
+        trend_data = tf.get("trend", tf.get("trend_state", ""))
+        if isinstance(trend_data, dict):
+            trend_data = trend_data.get("trend", "")
+        trend = str(trend_data).upper()
 
         if not trend:
 
@@ -551,15 +507,8 @@ def calculate_technical_confidence(
     # RSI
     # --------------------------------------------------------
 
-    rsi = (
-        find_numeric_value(
-            technical_analysis,
-            [
-                "rsi_1h",
-                "rsi",
-            ],
-        )
-    )
+    tf_1h = timeframes.get("1H") or timeframes.get("1h") or {}
+    rsi = safe_float(tf_1h.get("rsi")) if tf_1h.get("valid", True) else None
 
     if rsi is not None:
 
@@ -705,16 +654,8 @@ def calculate_technical_confidence(
     # MOMENTUM
     # --------------------------------------------------------
 
-    momentum = (
-        find_numeric_value(
-            technical_analysis,
-            [
-                "momentum_1h",
-                "momentum_pct",
-                "momentum",
-            ],
-        )
-    )
+    momentum_data = tf_1h.get("momentum") or {}
+    momentum = safe_float(momentum_data.get("3_candle_pct")) if isinstance(momentum_data, dict) and tf_1h.get("valid", True) else None
 
     if momentum is not None:
 
@@ -858,16 +799,11 @@ def calculate_market_confidence(
             "conflicting_factors": [],
         }
 
-    direct_score = (
-        find_numeric_value(
-            market_context,
-            [
-                "direction_market_agreement",
-                "market_confidence",
-                "market_score",
-            ],
-        )
-    )
+    agreement_data = market_context.get("direction_market_agreement") or {}
+    direct_score = safe_float(agreement_data.get("agreement_score")) if isinstance(agreement_data, dict) else None
+    # Agreement is already relative to the requested direction, on -1..1.
+    if direct_score is not None and not -1.0 <= direct_score <= 1.0:
+        direct_score = None
 
     evidence = []
 
@@ -880,47 +816,7 @@ def calculate_market_confidence(
     # --------------------------------------------------------
 
     if direct_score is not None:
-
-        if (
-            -1.5
-            <= direct_score
-            <= 1.5
-        ):
-
-            score = (
-                50.0
-                + (
-                    direct_score
-                    * 40.0
-                )
-            )
-
-        elif (
-            -100.0
-            <= direct_score
-            <= 100.0
-        ):
-
-            # If negative values are possible,
-            # treat as directional scale.
-
-            if direct_score < 0:
-
-                score = (
-                    50.0
-                    + (
-                        direct_score
-                        * 0.4
-                    )
-                )
-
-            else:
-
-                score = direct_score
-
-        else:
-
-            score = 50.0
+        score = 50.0 + direct_score * 40.0
 
         score = clamp(
             score,
@@ -951,25 +847,9 @@ def calculate_market_confidence(
     # MARKET BREADTH
     # --------------------------------------------------------
 
-    bullish_pct = (
-        find_numeric_value(
-            market_context,
-            [
-                "bullish_pct",
-                "market_bullish_pct",
-            ],
-        )
-    )
-
-    bearish_pct = (
-        find_numeric_value(
-            market_context,
-            [
-                "bearish_pct",
-                "market_bearish_pct",
-            ],
-        )
-    )
+    breadth = market_context.get("breadth") or {}
+    bullish_pct = safe_float(breadth.get("bullish_pct"))
+    bearish_pct = safe_float(breadth.get("bearish_pct"))
 
     if (
         bullish_pct is not None
@@ -1022,15 +902,12 @@ def calculate_market_confidence(
     # MARKET STRESS
     # --------------------------------------------------------
 
-    stress = (
-        find_numeric_value(
-            market_context,
-            [
-                "stress_score",
-                "market_stress_score",
-            ],
-        )
-    )
+    stress_data = market_context.get("market_stress") or {}
+    stress = safe_float(stress_data.get("stress_score")) if isinstance(stress_data, dict) else None
+    if stress is not None and 0.0 <= stress <= 1.0:
+        stress *= 100.0
+    else:
+        stress = None
 
     if stress is not None:
 
@@ -1070,15 +947,8 @@ def calculate_market_confidence(
     # RELATIVE STRENGTH VS BTC
     # --------------------------------------------------------
 
-    relative_strength = (
-        find_numeric_value(
-            market_context,
-            [
-                "relative_strength_vs_btc",
-                "relative_strength",
-            ],
-        )
-    )
+    relative_data = market_context.get("relative_strength_vs_btc") or {}
+    relative_strength = safe_float(relative_data.get("combined_relative_strength")) if isinstance(relative_data, dict) else None
 
     if relative_strength is not None:
 
@@ -1976,7 +1846,7 @@ def evaluate_evidence_gates(
 
     # Extremely weak technical evidence blocks eligibility.
 
-    elif technical_score < 45:
+    if technical_score is not None and technical_score < 45:
 
         reasons.append(
             "Technical evidence strongly conflicts with setup"
