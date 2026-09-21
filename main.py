@@ -1233,11 +1233,97 @@ def send_telegram_connection_test():
 # ============================================================
 
 
+
+
+# ============================================================
+# STEP 3: OPT-IN, ONE-SHOT, READ-ONLY INTEGRATION DIAGNOSTIC
+# No database connection, AI API, Telegram network call, or trading.
+# ============================================================
+def run_read_only_integration_diagnostic():
+    prefix = "INTEGRATION DIAGNOSTIC: "
+    print(prefix + "START (BTCUSDT/ETHUSDT; no sends or trades)", flush=True)
+    required = (bitget_market, technical_analysis, market_context,
+                confidence_engine, signal_selector, telegram_formatter)
+    if not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED or any(m is None for m in required):
+        print(prefix + "FAIL (safety flag or required module)", flush=True)
+        return False
+    try:
+        frames = ("5m", "15m", "30m", "1H", "4H", "1D")
+        analyses, candle_sets, prices = {}, {}, {}
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            candles = bitget_market.get_multi_timeframe_candles(
+                symbol=symbol, timeframes=frames, limit=200)
+            counts = {frame: len(candles.get(frame, [])) for frame in frames}
+            print(prefix + symbol + " candle counts " + str(counts), flush=True)
+            if any(n < 55 for n in counts.values()):
+                raise ValueError(symbol + " insufficient closed candle history")
+            analysis = technical_analysis.analyze_symbol(
+                symbol=symbol, multi_timeframe_candles=candles)
+            if not all(analysis.get("timeframes", {}).get(frame, {}).get("valid") for frame in frames):
+                raise ValueError(symbol + " invalid technical timeframe")
+            last = candles["5m"][-1]
+            price = float(last["close"])
+            if price <= 0:
+                raise ValueError(symbol + " invalid last closed price")
+            analyses[symbol], candle_sets[symbol], prices[symbol] = analysis, candles, price
+        full_context = market_context.build_market_context(
+            btc_analysis=analyses["BTCUSDT"], eth_analysis=analyses["ETHUSDT"],
+            all_symbol_analyses=list(analyses.values()))
+        opportunities = []
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            for direction in ("LONG", "SHORT"):
+                coin_context = market_context.build_coin_market_context(
+                    coin_analysis=analyses[symbol], btc_analysis=analyses["BTCUSDT"],
+                    market_context=full_context, direction=direction)
+                # Invoke the actual controller stages; memory/AI deliberately deferred.
+                opportunity = analyse_opportunity(
+                    symbol=symbol, direction=direction, current_price=prices[symbol],
+                    multi_timeframe_candles=candle_sets[symbol],
+                    full_market_context=coin_context, database_connection=None)
+                confidence = opportunity.get("confidence_result", {})
+                if not isinstance(confidence, dict) or confidence.get("component_scores", {}).get("technical") is None:
+                    raise ValueError(symbol + " " + direction + " confidence stage failed")
+                if confidence.get("eligible") and (float(confidence.get("final_confidence", 0)) < 75
+                                                  or confidence.get("evidence_gates", {}).get("passed") is not True):
+                    raise ValueError("Confidence safety gate violation")
+                opportunities.append(opportunity)
+                print(prefix + symbol + " " + direction + " " + json.dumps({
+                    "score": confidence.get("final_confidence"),
+                    "decision": confidence.get("decision"),
+                    "eligible": confidence.get("eligible"),
+                    "gate_reasons": confidence.get("evidence_gates", {}).get("reasons"),
+                    "rejection_reason": confidence.get("rejection_reason")}, default=str), flush=True)
+        result = process_analysis_batch(opportunities, recent_signal_times={})
+        selected = result.get("selection", {}).get("selected", [])
+        formatted = result.get("formatted_signals", [])
+        if result.get("opportunity_count") != 4 or result.get("selected_count") != len(selected):
+            raise ValueError("Selector batch count mismatch")
+        if len(formatted) > len(selected):
+            raise ValueError("Formatter output count exceeds selected count")
+        for opportunity in selected:
+            conf = opportunity.get("confidence_result", {})
+            if (float(conf.get("final_confidence", 0)) < 75 or
+                    conf.get("eligible") is not True or
+                    conf.get("evidence_gates", {}).get("passed") is not True):
+                raise ValueError("Selected signal violates confidence gate")
+        print(prefix + "selection " + json.dumps({
+            "considered": len(opportunities), "selected": len(selected),
+            "formatted": len(formatted)}, default=str), flush=True)
+        print(prefix + "PASS (one shot; read only; no signal sent; no trade)", flush=True)
+        return True
+    except Exception as exc:
+        print(prefix + "FAIL (" + type(exc).__name__ + ": " + str(exc) + ")", flush=True)
+        return False
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_INTEGRATION_TEST_ON_START", "").lower().strip() == "true":
+            run_read_only_integration_diagnostic()
 
         if os.environ.get("SIGNALS2_TELEGRAM_TEST_ON_START", "").lower().strip() == "true":
             send_telegram_connection_test()
