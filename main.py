@@ -1394,6 +1394,69 @@ if __name__ == "__main__":
                 except Exception as exc:
                     print("SELECTOR DIAGNOSTIC: FAIL (" + type(exc).__name__ + ": " + str(exc) + ")", flush=True)
 
+        # One-shot formatter diagnostic: synthetic data only; no Telegram calls or trades.
+        if os.environ.get("SIGNALS2_FORMATTER_TEST_ON_START", "").lower().strip() == "true":
+            print("FORMATTER DIAGNOSTIC: starting synthetic approval checks", flush=True)
+            if telegram_formatter is None:
+                print("FORMATTER DIAGNOSTIC: FAIL (module unavailable)", flush=True)
+            else:
+                try:
+                    now = utc_now()
+
+                    def formatter_sample(score=75.0, selected=True, eligible=True,
+                                         decision="ELIGIBLE", gate_passed=True):
+                        return {
+                            "symbol": "BTCUSDT", "direction": "LONG",
+                            "entry_price": 67452.30, "observed_at": now,
+                            "selector_status": "SELECTED" if selected else "NOT_SELECTED",
+                            "confidence_result": {
+                                "final_confidence": score, "eligible": eligible,
+                                "decision": decision,
+                                "evidence_gates": {"passed": gate_passed,
+                                                   "reasons": [] if gate_passed else ["Synthetic failure"]},
+                            },
+                        }
+
+                    checks = []
+
+                    def formatter_check(name, condition):
+                        passed = bool(condition)
+                        checks.append(passed)
+                        print("FORMATTER DIAGNOSTIC: " + name + " " +
+                              ("PASS" if passed else "FAIL"), flush=True)
+
+                    build = telegram_formatter.build_signal_message_record
+                    good = build(formatter_sample())
+                    message = good.get("message") or ""
+                    formatter_check("approved 75 ready", good.get("ready") is True)
+                    formatter_check("basic message fields", all(part in message for part in (
+                        "TRADE SIGNAL", "LONG", "BTCUSDT", "Confidence:", "Time:", "Entry:")))
+                    formatter_check("no TP or SL", all(part not in message for part in (
+                        "TP1", "TP2", "TP3", "Stop Loss", "Stop-loss", "SL:")))
+                    formatter_check("below 75 rejected", build(formatter_sample(score=74.99)).get("ready") is False)
+                    formatter_check("unselected rejected", build(formatter_sample(selected=False)).get("ready") is False)
+                    formatter_check("engine ineligible rejected", build(formatter_sample(eligible=False)).get("ready") is False)
+                    formatter_check("rejected decision rejected", build(formatter_sample(decision="REJECTED")).get("ready") is False)
+                    formatter_check("failed evidence gate rejected", build(formatter_sample(gate_passed=False)).get("ready") is False)
+                    no_gates = formatter_sample()
+                    no_gates["confidence_result"].pop("evidence_gates")
+                    formatter_check("missing evidence gates rejected", build(no_gates).get("ready") is False)
+                    no_time = formatter_sample()
+                    no_time.pop("observed_at")
+                    formatter_check("missing timestamp rejected", build(no_time).get("ready") is False)
+                    no_price = formatter_sample()
+                    no_price["entry_price"] = 0
+                    formatter_check("invalid price rejected", build(no_price).get("ready") is False)
+                    formatter_check("unselected direct format blocked",
+                                    telegram_formatter.format_trade_signal(formatter_sample(selected=False)) is None)
+                    formatter_check("no sending enabled", TELEGRAM_SENDING_ENABLED is False)
+                    count = sum(checks)
+                    print("FORMATTER DIAGNOSTIC: " + ("PASS" if count == len(checks) else "FAIL") +
+                          " (" + str(count) + "/" + str(len(checks)) +
+                          "; synthetic only; no signal sent)", flush=True)
+                except Exception as exc:
+                    print("FORMATTER DIAGNOSTIC: FAIL (" + type(exc).__name__ + ": " + str(exc) + ")", flush=True)
+
         # One-shot read-only market data diagnostic. Does not scan continuously,
         # calculate signals, send Telegram messages, or place trades.
         if os.environ.get("SIGNALS2_BITGET_TEST_ON_START", "").lower().strip() == "true":
