@@ -42,7 +42,7 @@ from typing import Dict, Any, List, Optional
 # ============================================================
 
 
-SIGNAL_SELECTOR_VERSION = "signals2-selector-v1"
+SIGNAL_SELECTOR_VERSION = "signals2-selector-v1.1"
 
 MIN_CONFIDENCE = 75.0
 
@@ -476,6 +476,29 @@ def passes_confidence_gate(
             ),
         }
 
+    # Fail closed if the confidence engine reports a contradictory
+    # decision or any failed evidence gates, even if eligible=True.
+    decision = str(confidence_result.get("decision", "")).upper().strip()
+    if decision != "ELIGIBLE":
+        return {
+            "passed": False,
+            "confidence": confidence,
+            "reason": confidence_result.get("rejection_reason") or
+                      "Confidence engine decision is not ELIGIBLE",
+        }
+
+    gate_reasons = confidence_result.get("gate_reasons")
+    if gate_reasons is None:
+        gate_reasons = []
+    if not isinstance(gate_reasons, list) or gate_reasons:
+        return {
+            "passed": False,
+            "confidence": confidence,
+            "reason": "; ".join(str(reason) for reason in gate_reasons)
+                      if isinstance(gate_reasons, list) and gate_reasons
+                      else "Confidence evidence gates are invalid",
+        }
+
     return {
 
         "passed":
@@ -528,13 +551,10 @@ def calculate_signal_age_seconds(
 
         return None
 
-    return max(
-        0.0,
-        (
-            now
-            - observed_at
-        ).total_seconds(),
-    )
+    age = (now - observed_at).total_seconds()
+    if age < -5.0:
+        return None
+    return max(0.0, age)
 
 
 # ============================================================
@@ -555,22 +575,19 @@ def passes_age_gate(
         )
     )
 
-    # Missing timestamp is not automatically rejected here.
-    # Validation/integration can decide whether timestamps
-    # become mandatory later.
-
+    # Fail closed: an undated opportunity cannot be verified as fresh.
     if age is None:
 
         return {
 
             "passed":
-            True,
+            False,
 
             "age_seconds":
             None,
 
             "reason":
-            None,
+            "Missing or invalid opportunity timestamp",
         }
 
     if age > max_age_seconds:
