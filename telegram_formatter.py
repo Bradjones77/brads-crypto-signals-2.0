@@ -43,7 +43,7 @@ from typing import Dict, Any, Optional
 # ============================================================
 
 
-TELEGRAM_FORMATTER_VERSION = "signals2-telegram-formatter-v1"
+TELEGRAM_FORMATTER_VERSION = "signals2-telegram-formatter-v2-approval-gates"
 
 MIN_CONFIDENCE = 75.0
 
@@ -440,9 +440,7 @@ def extract_signal_time(
 
                 return parsed
 
-    return datetime.now(
-        timezone.utc
-    )
+    return None
 
 
 # ============================================================
@@ -500,6 +498,26 @@ def validate_signal(
             opportunity
         )
     )
+
+    # Format only opportunities actually selected by signal_selector.py.
+    # A high numeric score alone does not authorize signal delivery.
+    if opportunity.get("selector_status") != "SELECTED":
+        reasons.append("Opportunity was not selected by signal selector")
+
+    confidence_result = opportunity.get("confidence_result")
+    if not isinstance(confidence_result, dict):
+        reasons.append("Missing confidence engine result")
+    else:
+        if confidence_result.get("eligible") is not True:
+            reasons.append("Confidence engine did not mark signal eligible")
+        if str(confidence_result.get("decision", "")).strip().upper() != "ELIGIBLE":
+            reasons.append("Confidence engine decision is not ELIGIBLE")
+        gates = confidence_result.get("evidence_gates")
+        if not isinstance(gates, dict) or gates.get("passed") is not True:
+            reasons.append("Confidence evidence gates did not pass")
+
+    if extract_signal_time(opportunity) is None:
+        reasons.append("Missing or invalid signal timestamp")
 
     if not symbol:
 
@@ -948,6 +966,14 @@ def format_selected_signals(
 if __name__ == "__main__":
 
     example = {
+
+        "selector_status": "SELECTED",
+        "confidence_result": {
+            "final_confidence": 82.4,
+            "eligible": True,
+            "decision": "ELIGIBLE",
+            "evidence_gates": {"passed": True, "reasons": []},
+        },
 
         "symbol":
         "BTCUSDT",
