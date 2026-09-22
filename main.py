@@ -1600,11 +1600,75 @@ def run_market_memory_diagnostic():
                 pass
 
 
+def run_outcome_tracking_diagnostic():
+    """One-shot follow-up for only Step 4.8 records; never scans or sends."""
+    prefix = "OUTCOME TRACKING DIAGNOSTIC: "
+    print(prefix + "START (Step 4.8 observations only; no sends or trades)", flush=True)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or memory_engine is None or outcome_tracker is None or bitget_market is None):
+        print(prefix + "FAIL (safety flags or required module unavailable)", flush=True)
+        return False
+    connection = None
+    try:
+        connection = memory_engine.connect()
+        with connection.cursor(cursor_factory=__import__("psycopg2.extras", fromlist=["RealDictCursor"]).RealDictCursor) as cursor:
+            cursor.execute("""
+                SELECT * FROM signals2_outcomes
+                WHERE opportunity_id IN (
+                    SELECT opportunity_id FROM signals2_opportunities
+                    WHERE strategy_version = %s AND symbol IN ('BTCUSDT', 'ETHUSDT')
+                ) ORDER BY opportunity_time ASC
+            """, ("STEP4.8_MARKET_MEMORY_TEST",))
+            records = [dict(row) for row in cursor.fetchall()]
+        if len(records) != 4 or {(r["symbol"], r["direction"]) for r in records} != {
+                ("BTCUSDT", "LONG"), ("BTCUSDT", "SHORT"),
+                ("ETHUSDT", "LONG"), ("ETHUSDT", "SHORT")}:
+            raise ValueError("Expected exactly four distinct Step 4.8 records")
+        checked = updated = waiting = completed = 0
+        for record in records:
+            # update_one_outcome fetches public closed candles and updates this record only.
+            result = outcome_tracker.update_one_outcome(connection, record)
+            checked += 1
+            updated += int(bool(result.get("updated")))
+            waiting += int(not result.get("updated"))
+            completed += int(bool(result.get("complete")))
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT price_1m, price_5m, price_10m, price_30m, price_1h, price_4h, price_12h, price_24h, outcome_complete FROM signals2_outcomes WHERE opportunity_id = %s", (record["opportunity_id"],))
+                row = cursor.fetchone()
+            if row is None or (row[-1] and any(value is None for value in row[:-1])):
+                raise RuntimeError("Outcome readback invalid")
+            checkpoints = sum(value is not None for value in row[:-1])
+            print(prefix + str(record["symbol"]) + " " + str(record["direction"]) +
+                  "; checkpoints=" + str(checkpoints) + "; updated=" +
+                  str(bool(result.get("updated"))) + "; complete=" + str(bool(row[-1])), flush=True)
+        print(prefix + "PASS (checked=" + str(checked) + "; updated=" + str(updated) +
+              "; waiting=" + str(waiting) + "; completed=" + str(completed) +
+              "; no sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_OUTCOME_TEST_ON_START", "").lower().strip() == "true":
+            run_outcome_tracking_diagnostic()
 
         if os.environ.get("SIGNALS2_MARKET_MEMORY_TEST_ON_START", "").lower().strip() == "true":
             run_market_memory_diagnostic()
