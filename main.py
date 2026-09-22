@@ -1758,11 +1758,88 @@ def run_pattern_memory_diagnostic():
             except Exception:
                 pass
 
+# ============================================================
+# STEP 4.11: OPT-IN HISTORICAL CANDLE AND OUTCOME DIAGNOSTIC
+# Public GET data; only the four existing Step 4.8 outcomes may be updated.
+# ============================================================
+def run_step411_historical_diagnostic():
+    prefix = "STEP 4.11 DIAGNOSTIC: "
+    print(prefix + "START (public historical candles; four existing outcomes only)", flush=True)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or bitget_market is None or outcome_tracker is None or memory_engine is None):
+        print(prefix + "FAIL (safety flags or missing module)", flush=True)
+        return False
+    connection = None
+    try:
+        minute = 60_000
+        # Exercise actual paginated endpoint across a page boundary, on closed minutes.
+        end_ms = (int(time.time() * 1000) // minute - 2) * minute
+        start_ms = end_ms - 181 * minute
+        candles = bitget_market.get_historical_1m_candles("BTCUSDT", start_ms, end_ms)
+        if len(candles) != 181 or any(c["timestamp"] != start_ms + i * minute
+                                       for i, c in enumerate(candles)):
+            raise ValueError("Historical page continuity or count mismatch")
+        print(prefix + "historical BTCUSDT 181 closed minutes: PASS (pagination)", flush=True)
+        connection = memory_engine.connect()
+        with connection.cursor(cursor_factory=__import__("psycopg2.extras", fromlist=["RealDictCursor"]).RealDictCursor) as cursor:
+            cursor.execute("""
+                SELECT r.* FROM signals2_outcomes r
+                JOIN signals2_opportunities o ON o.opportunity_id = r.opportunity_id
+                WHERE o.strategy_version = %s AND o.symbol IN ('BTCUSDT','ETHUSDT')
+                ORDER BY r.opportunity_time ASC
+            """, ("STEP4.8_MARKET_MEMORY_TEST",))
+            records = [dict(row) for row in cursor.fetchall()]
+        if len(records) != 4 or {(r["symbol"], r["direction"]) for r in records} != {
+                ("BTCUSDT", "LONG"), ("BTCUSDT", "SHORT"),
+                ("ETHUSDT", "LONG"), ("ETHUSDT", "SHORT")}:
+            raise ValueError("Expected exactly four Step 4.8 outcomes")
+        completed = updated = waiting = 0
+        for record in records:
+            result = outcome_tracker.update_one_outcome(connection, record)
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT price_1m, price_5m, price_10m, price_30m, price_1h,
+                           price_4h, price_12h, price_24h, outcome_complete
+                    FROM signals2_outcomes WHERE opportunity_id = %s
+                """, (record["opportunity_id"],))
+                row = cursor.fetchone()
+            if row is None or (row[-1] and any(v is None for v in row[:-1])):
+                raise ValueError("Incomplete outcome incorrectly marked complete")
+            updated += int(bool(result.get("updated")))
+            waiting += int(not result.get("updated"))
+            completed += int(bool(row[-1]))
+            print(prefix + str(record["symbol"]) + " " + str(record["direction"]) +
+                  "; checkpoints=" + str(sum(v is not None for v in row[:-1])) +
+                  "; complete=" + str(bool(row[-1])), flush=True)
+        print(prefix + "PASS (historical pagination verified; outcomes checked=4; updated=" +
+              str(updated) + "; waiting=" + str(waiting) + "; completed=" +
+              str(completed) + "; no sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        # Do not expose database connection details in logs.
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_STEP411_TEST_ON_START", "").lower().strip() == "true":
+            run_step411_historical_diagnostic()
 
         if os.environ.get("SIGNALS2_PATTERN_MEMORY_TEST_ON_START", "").lower().strip() == "true":
             run_pattern_memory_diagnostic()
