@@ -1397,11 +1397,89 @@ def run_memory_schema_diagnostic():
                 pass
 
 
+# ============================================================
+# STEP 4.7: OPT-IN SYNTHETIC MEMORY WRITE / READ DIAGNOSTIC
+# Writes one clearly labelled test record; never sends or trades.
+# ============================================================
+def run_memory_storage_diagnostic():
+    prefix = "MEMORY STORAGE DIAGNOSTIC: "
+    print(prefix + "START (one synthetic record; no sends or trades)", flush=True)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or memory_engine is None):
+        print(prefix + "FAIL (safety flag or memory module unavailable)", flush=True)
+        return False
+    connection = None
+    try:
+        # Stable timestamp makes a restart idempotent: ON CONFLICT DO NOTHING.
+        from datetime import datetime as _datetime, timezone as _timezone
+        test_time = _datetime(2026, 9, 22, 0, 0, tzinfo=_timezone.utc)
+        test_symbol = "SIGNALS2TESTUSDT"
+        test_direction = "LONG"
+        test_id = memory_engine.build_opportunity_id(
+            test_symbol, test_direction, test_time.isoformat())
+        connection = memory_engine.connect()
+        # Schema must already exist from Step 4.6. Do not initialize here.
+        record_id = memory_engine.store_opportunity(
+            conn=connection, symbol=test_symbol, direction=test_direction,
+            entry_price=100.0, decision="SYNTHETIC_TEST_REJECTED",
+            technical_features={"test_only": True},
+            market_features={"test_only": True},
+            raw_analysis={"test_only": True},
+            raw_market_context={"test_only": True},
+            final_confidence=0.0, rejection_reason="Step 4.7 synthetic test only",
+            signal_sent=False, model_version="STEP4.7_TEST",
+            strategy_version="STEP4.7_TEST", created_at=test_time)
+        if record_id != test_id:
+            raise RuntimeError("Synthetic ID mismatch")
+        record = memory_engine.get_opportunity(connection, test_id)
+        if (not record or record.get("symbol") != test_symbol
+                or record.get("direction") != test_direction
+                or record.get("decision") != "SYNTHETIC_TEST_REJECTED"
+                or record.get("signal_sent") is not False
+                or float(record.get("entry_price") or 0) != 100.0):
+            raise RuntimeError("Synthetic opportunity readback mismatch")
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT symbol, direction, entry_price, outcome_complete
+                FROM signals2_outcomes WHERE opportunity_id = %s
+            """, (test_id,))
+            outcome = cursor.fetchone()
+            cursor.execute("""
+                SELECT COUNT(*) FROM signals2_opportunities
+                WHERE opportunity_id = %s
+            """, (test_id,))
+            count = cursor.fetchone()[0]
+        if (not outcome or outcome[0] != test_symbol
+                or outcome[1] != test_direction or float(outcome[2]) != 100.0
+                or outcome[3] is not False or count != 1):
+            raise RuntimeError("Synthetic outcome or duplicate check failed")
+        print(prefix + "PASS (1 synthetic opportunity and matching pending outcome verified; no sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        # Do not log exception text; it could contain database credentials.
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_MEMORY_STORAGE_TEST_ON_START", "").lower().strip() == "true":
+            run_memory_storage_diagnostic()
 
         if os.environ.get("SIGNALS2_MEMORY_SCHEMA_TEST_ON_START", "").lower().strip() == "true":
             run_memory_schema_diagnostic()
