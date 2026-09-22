@@ -450,12 +450,16 @@ def historical_price_at_horizon(
     candles: List[Dict[str, Any]],
     opportunity_timestamp: float,
     horizon_seconds: int,
+    now_timestamp: Optional[float] = None,
 ) -> Optional[float]:
-    """Use a completed 1m candle only when its close is close to the target.
+    """Use the first completed 1m close at/after the target, at most 60s late.
 
-    Candle timestamps mark the OPEN, not the CLOSE. Never substitute a
-    5m/15m candle close for an exact 1m/5m checkpoint.
+    A candle timestamp is its OPEN in milliseconds. A close that is still in
+    the future must never be used, even if an exchange response includes it.
+    Missing or aged-out history remains missing; never use a coarser candle.
     """
+    if now_timestamp is None:
+        now_timestamp = utc_now().timestamp()
     target = opportunity_timestamp + horizon_seconds
     candidates = []
     for candle in candles:
@@ -463,13 +467,14 @@ def historical_price_at_horizon(
         if ts is None:
             continue
         close_time = ts + 60
-        if target <= close_time <= target + 60:
-            try:
-                price = float(candle["close"])
-            except (ValueError, TypeError, KeyError):
-                continue
-            if math.isfinite(price) and price > 0:
-                candidates.append((close_time, price))
+        if not (target <= close_time <= target + 60 and close_time <= now_timestamp):
+            continue
+        try:
+            price = float(candle["close"])
+        except (ValueError, TypeError, KeyError):
+            continue
+        if math.isfinite(price) and price > 0:
+            candidates.append((close_time, price))
     return min(candidates)[1] if candidates else None
 
 
@@ -921,6 +926,7 @@ def calculate_outcome_fields(
                 candles=candles,
                 opportunity_timestamp=opportunity_timestamp,
                 horizon_seconds=horizon_seconds,
+                now_timestamp=now_timestamp,
             )
         )
 
@@ -1271,6 +1277,20 @@ def update_one_outcome(
             now_timestamp=now_timestamp,
         )
     )
+
+    # Behaviour is derived from checkpoint values; without any new price
+    # checkpoint or excursion, there is no reason to issue another DB write.
+    new_price_fields = [key for key in fields if key.startswith("price_")]
+    new_excursion_fields = [key for key in fields if key in (
+        "max_favorable_excursion_pct", "max_adverse_excursion_pct",
+        "highest_price", "lowest_price",
+    ) and opportunity.get(key) is None]
+    if not new_price_fields and not new_excursion_fields:
+        return {
+            "opportunity_id": opportunity_id,
+            "updated": False,
+            "reason": "No new observable outcome fields",
+        }
 
     if not fields:
 
