@@ -1316,11 +1316,48 @@ def run_read_only_integration_diagnostic():
         return False
 
 
+def run_read_only_database_diagnostic():
+    """One-shot PostgreSQL connectivity check; no schema changes or data writes."""
+    prefix = "DATABASE DIAGNOSTIC: "
+    print(prefix + "START (read only; no writes)", flush=True)
+    database_url = os.environ.get("SIGNALS2_DATABASE_URL", "").strip()
+    if not database_url:
+        print(prefix + "FAIL (SIGNALS2_DATABASE_URL is missing)", flush=True)
+        return False
+    connection = None
+    try:
+        import psycopg2
+        # Set read-only before the first query; do not log connection details.
+        connection = psycopg2.connect(database_url, connect_timeout=8)
+        connection.set_session(readonly=True, autocommit=False)
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            result = cursor.fetchone()
+        if result != (1,):
+            raise RuntimeError("Unexpected database response")
+        print(prefix + "PASS (SELECT 1; read only; no data written)", flush=True)
+        return True
+    except Exception as exc:
+        # Never print exception messages: they may include database host or credentials.
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.rollback()
+                connection.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_DATABASE_TEST_ON_START", "").lower().strip() == "true":
+            run_read_only_database_diagnostic()
 
         if os.environ.get("SIGNALS2_INTEGRATION_TEST_ON_START", "").lower().strip() == "true":
             run_read_only_integration_diagnostic()
