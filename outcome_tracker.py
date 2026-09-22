@@ -3,7 +3,7 @@ import math
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
-from bitget_market import get_candles
+from bitget_market import get_candles, get_historical_1m_candles
 
 from memory_engine import (
     get_pending_outcomes,
@@ -1241,19 +1241,16 @@ def update_one_outcome(
             "Waiting for first historical candle",
         }
 
-    # Fetch the most recent 1m candles only. Bitget's 1000-candle
-    # limit means older checkpoints must remain missing rather than
-    # being fabricated from coarser candles.
-    granularity = "1m"
-    limit = 1000
-
-    candles = (
-        get_candles(
-            symbol=symbol,
-            granularity=granularity,
-            limit=limit,
-        )
-    )
+    # Fetch the full history once the 24-hour horizon has elapsed.
+    # Before then, retain the existing recent-candle checkpoint behaviour.
+    if age_seconds >= OUTCOME_HORIZONS["24h"] + 60:
+        minute_ms = 60_000
+        start_ms = (int(opportunity_timestamp * 1000) // minute_ms) * minute_ms
+        # Include the minute containing the 24h target, so its close is available.
+        end_ms = start_ms + (24 * 60 + 2) * minute_ms
+        candles = get_historical_1m_candles(symbol, start_ms, end_ms)
+    else:
+        candles = get_candles(symbol=symbol, granularity="1m", limit=1000)
 
     if not candles:
 
