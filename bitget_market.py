@@ -701,6 +701,63 @@ def get_candles(
     return _validate_closed_candles(candles, granularity, int(time.time() * 1000), limit)
 
 
+
+# ============================================================
+# HISTORICAL 1-MINUTE CANDLES (READ-ONLY)
+# ============================================================
+
+def get_historical_1m_candles(symbol: str, start_ms: int, end_ms: int) -> List[Dict[str, float]]:
+    """Fetch fully closed 1m candles over [start_ms, end_ms), in <=180m pages.
+
+    Fail closed if Bitget omits any minute. Never substitute larger candles.
+    The caller must request an interval ending no later than the last closed minute.
+    """
+    minute = 60_000
+    start_ms, end_ms = int(start_ms), int(end_ms)
+    if start_ms % minute or end_ms % minute or end_ms <= start_ms:
+        raise ValueError("Historical interval must have aligned, increasing minute boundaries")
+    if end_ms > (int(time.time() * 1000) // minute) * minute:
+        raise ValueError("Historical interval includes an unclosed minute")
+    if end_ms - start_ms > 25 * 60 * minute:
+        raise ValueError("Historical request exceeds 25-hour safety limit")
+    output = []
+    for page_start in range(start_ms, end_ms, 180 * minute):
+        page_end = min(page_start + 180 * minute, end_ms)
+        data = _request(
+            "/api/v2/mix/market/history-candles",
+            params={"symbol": symbol.upper().strip(), "productType": PRODUCT_TYPE,
+                    "granularity": "1m", "startTime": str(page_start),
+                    "endTime": str(page_end), "limit": "200"},
+        )
+        if not isinstance(data, list):
+            raise ValueError("Missing historical candle page")
+        page = {}
+        for row in data:
+            if not isinstance(row, (list, tuple)) or len(row) < 6:
+                raise ValueError("Malformed historical candle")
+            stamp = int(row[0])
+            if not page_start <= stamp < page_end or stamp % minute:
+                raise ValueError("Unexpected historical candle timestamp")
+            if stamp in page:
+                raise ValueError("Duplicate historical candle")
+            values = [float(v) for v in row[1:6]]
+            op, hi, lo, cl, vol = values
+            if (not all(math.isfinite(v) for v in values) or
+                min(op, hi, lo, cl) <= 0 or vol < 0 or
+                hi < max(op, cl) or lo > min(op, cl)):
+                raise ValueError("Invalid historical OHLCV")
+            quote = float(row[6]) if len(row) > 6 else None
+            if quote is not None and (not math.isfinite(quote) or quote < 0):
+                raise ValueError("Invalid historical quote volume")
+            page[stamp] = {"timestamp": stamp, "open": op, "high": hi,
+                           "low": lo, "close": cl, "volume_base": vol,
+                           "volume_quote": quote}
+        expected = list(range(page_start, page_end, minute))
+        if sorted(page) != expected:
+            raise ValueError("Gap or missing minute in historical candle page")
+        output.extend(page[stamp] for stamp in expected)
+    return output
+
 # ============================================================
 # MULTI-TIMEFRAME SNAPSHOT
 # ============================================================
