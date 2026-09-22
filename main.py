@@ -865,6 +865,9 @@ def process_analysis_batch(
         "selection":
         selection,
 
+        "opportunities":
+        opportunities,
+
         "formatted_signals":
         formatted,
     }
@@ -891,26 +894,91 @@ def store_analysis_batch(
     batch_result: Dict[str, Any],
     database_connection=None,
 ):
+    """Store all considered opportunities, including selector rejections.
 
+    Does not connect automatically, send messages, or execute trades.
+    The caller supplies an explicit database connection. Fail closed on
+    malformed records and propagate database errors to the caller.
+    """
     if database_connection is None:
-
-        return {
-
-            "stored":
-            False,
-
-            "reason":
-            "Database connection not configured yet.",
-        }
-
-    return {
-
-        "stored":
-        False,
-
-        "reason":
-        "Final database integration still pending.",
-    }
+        return {"stored": False, "count": 0,
+                "reason": "Explicit database connection required."}
+    if memory_engine is None or technical_analysis is None or market_context is None:
+        raise RuntimeError("Required memory/feature module unavailable")
+    if not isinstance(batch_result, dict):
+        raise ValueError("Invalid analysis batch")
+    opportunities = batch_result.get("opportunities")
+    if not isinstance(opportunities, list):
+        raise ValueError("Batch must contain the complete opportunities list")
+    selection = batch_result.get("selection") or {}
+    if not isinstance(selection, dict):
+        raise ValueError("Invalid selection result")
+    selected = selection.get("selected") or []
+    if not isinstance(selected, list):
+        raise ValueError("Invalid selected list")
+    selected_ids = {id(item) for item in selected}
+    if len(selected_ids) != len(selected) or any(
+            not any(item is candidate for candidate in opportunities)
+            for item in selected):
+        raise ValueError("Selected items must belong to the original batch")
+    if batch_result.get("opportunity_count") != len(opportunities):
+        raise ValueError("Opportunity count mismatch")
+    stored_ids = []
+    for opportunity in opportunities:
+        if not isinstance(opportunity, dict):
+            raise ValueError("Malformed opportunity")
+        confidence = opportunity.get("confidence_result") or {}
+        if not isinstance(confidence, dict):
+            raise ValueError("Malformed confidence result")
+        score = float(confidence.get("final_confidence"))
+        if not __import__("math").isfinite(score) or not 0 <= score <= 100:
+            raise ValueError("Invalid confidence score")
+        technical = opportunity.get("technical_analysis") or {}
+        market = opportunity.get("market_context") or {}
+        if not isinstance(technical, dict) or not isinstance(market, dict):
+            raise ValueError("Malformed analysis features")
+        tech_features = technical_analysis.build_feature_vector(technical)
+        market_features = market_context.build_context_features(market)
+        if not isinstance(tech_features, dict) or not isinstance(market_features, dict):
+            raise ValueError("Feature extraction failed")
+        components = confidence.get("component_scores") or {}
+        if not isinstance(components, dict):
+            raise ValueError("Malformed confidence components")
+        is_selected = id(opportunity) in selected_ids
+        # Selection is not proof of Telegram delivery. Never mark as sent here.
+        decision = "SELECTED_NOT_SENT" if is_selected else "REJECTED"
+        reason = None if is_selected else (
+            opportunity.get("selector_rejection_reason")
+            or confidence.get("rejection_reason")
+            or "Not selected by batch selector"
+        )
+        record_id = memory_engine.store_opportunity(
+            conn=database_connection,
+            symbol=opportunity["symbol"],
+            direction=opportunity["direction"],
+            entry_price=opportunity["entry_price"],
+            decision=decision,
+            technical_features=tech_features,
+            market_features=market_features,
+            raw_analysis=technical,
+            raw_market_context=market,
+            final_confidence=score,
+            technical_confidence=components.get("technical"),
+            memory_confidence=components.get("memory"),
+            ai_confidence=components.get("ai"),
+            market_confidence=components.get("market"),
+            rejection_reason=reason,
+            signal_sent=False,
+            ai_analysis=opportunity.get("ai_result") or {},
+            model_version="STEP4.12_NO_AI",
+            strategy_version="STEP4.12_BATCH_MEMORY",
+            created_at=opportunity["observed_at"],
+        )
+        stored_ids.append(record_id)
+    if len(set(stored_ids)) != len(stored_ids):
+        raise ValueError("Duplicate opportunity IDs in batch")
+    return {"stored": True, "count": len(stored_ids),
+            "opportunity_ids": stored_ids, "signals_sent": 0}
 
 
 # ============================================================
@@ -1832,11 +1900,82 @@ def run_step411_historical_diagnostic():
                 pass
 
 
+# ============================================================
+# STEP 4.12: OPT-IN DATABASE BATCH STORAGE DIAGNOSTIC
+# Synthetic BTC/ETH observations, no market scanning or sending.
+# ============================================================
+def run_step412_batch_memory_diagnostic():
+    prefix = "STEP 4.12 DIAGNOSTIC: "
+    print(prefix + "START (synthetic batch; no sends or trades)", flush=True)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or any(module is None for module in
+                   (memory_engine, technical_analysis, market_context))):
+        print(prefix + "FAIL (safety flags or missing module)", flush=True)
+        return False
+    connection = None
+    try:
+        # Fixed timestamp means redeploying this diagnostic cannot duplicate rows.
+        test_time = datetime(2026, 9, 23, 0, 0, tzinfo=timezone.utc)
+        examples = []
+        for symbol in ("SIGNALS2STEP412BTC", "SIGNALS2STEP412ETH"):
+            for direction in ("LONG", "SHORT"):
+                examples.append({
+                    "symbol": symbol, "direction": direction,
+                    "entry_price": 100.0, "observed_at": test_time,
+                    "technical_analysis": {}, "market_context": {},
+                    "ai_result": {"available": False},
+                    "confidence_result": {
+                        "final_confidence": 50.0,
+                        "component_scores": {},
+                        "rejection_reason": "Step 4.12 synthetic test only",
+                    },
+                })
+        batch = {"opportunity_count": 4,
+                 "opportunities": examples,
+                 "selection": {"selected": [], "rejected": examples},
+                 "formatted_signals": []}
+        connection = memory_engine.connect()
+        result = store_analysis_batch(batch, database_connection=connection)
+        if not result.get("stored") or result.get("count") != 4:
+            raise ValueError("Batch storage count mismatch")
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT COUNT(*), COUNT(r.opportunity_id),
+                       COUNT(*) FILTER (WHERE o.signal_sent = FALSE),
+                       COUNT(*) FILTER (WHERE o.decision = 'REJECTED')
+                FROM signals2_opportunities o
+                LEFT JOIN signals2_outcomes r ON r.opportunity_id = o.opportunity_id
+                WHERE o.opportunity_id = ANY(%s)
+            """, (result["opportunity_ids"],))
+            counts = cursor.fetchone()
+        if counts != (4, 4, 4, 4):
+            raise ValueError("Database readback mismatch")
+        print(prefix + "PASS (4 synthetic opportunities + outcomes; no sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_STEP412_TEST_ON_START", "").lower().strip() == "true":
+            run_step412_batch_memory_diagnostic()
 
         if os.environ.get("SIGNALS2_STEP411_TEST_ON_START", "").lower().strip() == "true":
             run_step411_historical_diagnostic()
