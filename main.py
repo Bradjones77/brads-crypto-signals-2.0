@@ -1472,11 +1472,142 @@ def run_memory_storage_diagnostic():
                 pass
 
 
+# ============================================================
+# STEP 4.8: OPT-IN ONE-SHOT MARKET ANALYSIS -> MEMORY TEST
+# Real public candles; saves four LONG/SHORT observations, including
+# rejected candidates. No Telegram delivery or trade execution.
+# ============================================================
+def run_market_memory_diagnostic():
+    prefix = "MARKET MEMORY DIAGNOSTIC: "
+    print(prefix + "START (4 market observations; database writes; no sends or trades)", flush=True)
+    required = (bitget_market, technical_analysis, market_context,
+                confidence_engine, signal_selector, telegram_formatter, memory_engine)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or any(module is None for module in required)):
+        print(prefix + "FAIL (safety flags or required module unavailable)", flush=True)
+        return False
+    connection = None
+    try:
+        frames = ("5m", "15m", "30m", "1H", "4H", "1D")
+        analyses, candles_by_symbol, prices = {}, {}, {}
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            candles = bitget_market.get_multi_timeframe_candles(
+                symbol=symbol, timeframes=frames, limit=200)
+            if any(len(candles.get(frame, [])) < 55 for frame in frames):
+                raise ValueError("Insufficient candle history for " + symbol)
+            analysis = technical_analysis.analyze_symbol(
+                symbol=symbol, multi_timeframe_candles=candles)
+            if not all(analysis.get("timeframes", {}).get(frame, {}).get("valid") for frame in frames):
+                raise ValueError("Invalid technical timeframe for " + symbol)
+            price = float(candles["5m"][-1]["close"])
+            if not __import__("math").isfinite(price) or price <= 0:
+                raise ValueError("Invalid price for " + symbol)
+            analyses[symbol], candles_by_symbol[symbol], prices[symbol] = analysis, candles, price
+        context = market_context.build_market_context(
+            btc_analysis=analyses["BTCUSDT"], eth_analysis=analyses["ETHUSDT"],
+            all_symbol_analyses=list(analyses.values()))
+        observed_at = utc_now()
+        opportunities = []
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            for direction in ("LONG", "SHORT"):
+                coin_context = market_context.build_coin_market_context(
+                    coin_analysis=analyses[symbol], btc_analysis=analyses["BTCUSDT"],
+                    market_context=context, direction=direction)
+                opportunity = analyse_opportunity(
+                    symbol=symbol, direction=direction, current_price=prices[symbol],
+                    multi_timeframe_candles=candles_by_symbol[symbol],
+                    full_market_context=coin_context, database_connection=None,
+                    observed_at=observed_at)
+                confidence = opportunity.get("confidence_result") or {}
+                if confidence.get("component_scores", {}).get("technical") is None:
+                    raise ValueError("Confidence analysis missing for " + symbol + " " + direction)
+                score = float(confidence.get("final_confidence", 0))
+                if not __import__("math").isfinite(score) or score < 0 or score > 100:
+                    raise ValueError("Invalid confidence score")
+                if confidence.get("eligible") and (score < MINIMUM_SIGNAL_CONFIDENCE or
+                        confidence.get("evidence_gates", {}).get("passed") is not True):
+                    raise ValueError("Confidence safety gate violation")
+                opportunities.append(opportunity)
+        batch = process_analysis_batch(opportunities, recent_signal_times={})
+        selected = batch.get("selection", {}).get("selected", [])
+        if batch.get("opportunity_count") != 4 or len(selected) != batch.get("selected_count"):
+            raise ValueError("Selector count mismatch")
+        # A selected candidate is NOT a sent signal. Preserve that distinction.
+        connection = memory_engine.connect()
+        stored_ids = []
+        for opportunity in opportunities:
+            confidence = opportunity["confidence_result"]
+            components = confidence.get("component_scores") or {}
+            technical = opportunity.get("technical_analysis") or {}
+            market = opportunity.get("market_context") or {}
+            try:
+                tech_features = technical_analysis.build_feature_vector(technical) or {}
+            except Exception:
+                tech_features = {}
+            try:
+                market_features = market_context.build_context_features(market) or {}
+            except Exception:
+                market_features = {}
+            if not isinstance(tech_features, dict) or not isinstance(market_features, dict):
+                raise ValueError("Feature extraction returned invalid type")
+            record_id = memory_engine.store_opportunity(
+                conn=connection, symbol=opportunity["symbol"],
+                direction=opportunity["direction"],
+                entry_price=opportunity["entry_price"],
+                decision=str(confidence.get("decision") or "REJECTED"),
+                technical_features=tech_features, market_features=market_features,
+                raw_analysis=technical, raw_market_context=market,
+                final_confidence=float(confidence["final_confidence"]),
+                technical_confidence=components.get("technical"),
+                memory_confidence=components.get("memory"),
+                ai_confidence=components.get("ai"),
+                market_confidence=components.get("market"),
+                rejection_reason=confidence.get("rejection_reason"),
+                signal_sent=False, ai_analysis=opportunity.get("ai_result") or {},
+                model_version="STEP4.8_NO_AI", strategy_version="STEP4.8_MARKET_MEMORY_TEST",
+                created_at=opportunity["observed_at"])
+            record = memory_engine.get_opportunity(connection, record_id)
+            if (not record or record.get("symbol") != opportunity["symbol"]
+                    or record.get("direction") != opportunity["direction"]
+                    or record.get("signal_sent") is not False):
+                raise RuntimeError("Opportunity readback mismatch")
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM signals2_outcomes WHERE opportunity_id = %s", (record_id,))
+                if cursor.fetchone()[0] != 1:
+                    raise RuntimeError("Missing matching outcome")
+            stored_ids.append(record_id)
+            print(prefix + opportunity["symbol"] + " " + opportunity["direction"] +
+                  " stored; confidence=" + str(confidence["final_confidence"]) +
+                  "; decision=" + str(confidence.get("decision")), flush=True)
+        if len(set(stored_ids)) != 4:
+            raise RuntimeError("Duplicate opportunity IDs")
+        print(prefix + "PASS (4 market observations and matching outcomes verified; no sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        # Do not print exception content; it could contain database credentials.
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_MARKET_MEMORY_TEST_ON_START", "").lower().strip() == "true":
+            run_market_memory_diagnostic()
 
         if os.environ.get("SIGNALS2_MEMORY_STORAGE_TEST_ON_START", "").lower().strip() == "true":
             run_memory_storage_diagnostic()
