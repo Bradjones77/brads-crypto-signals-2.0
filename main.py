@@ -1350,11 +1350,61 @@ def run_read_only_database_diagnostic():
                 pass
 
 
+# ============================================================
+# STEP 4: OPT-IN, ONE-SHOT MEMORY SCHEMA INITIALIZATION
+# Creates the four Signals 2.0 tables and indexes ONLY.
+# Does not store opportunities, fetch prices, send or trade.
+# ============================================================
+def run_memory_schema_diagnostic():
+    prefix = "MEMORY SCHEMA DIAGNOSTIC: "
+    print(prefix + "START (schema only; no opportunity data)", flush=True)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or memory_engine is None):
+        print(prefix + "FAIL (safety flag or memory module unavailable)", flush=True)
+        return False
+    connection = None
+    try:
+        connection = memory_engine.connect()
+        memory_engine.ensure_schema(connection)
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name IN (
+                    'signals2_opportunities', 'signals2_outcomes',
+                    'signals2_market_snapshots', 'signals2_model_versions')
+            """)
+            names = {row[0] for row in cursor.fetchall()}
+        if names != {'signals2_opportunities', 'signals2_outcomes',
+                     'signals2_market_snapshots', 'signals2_model_versions'}:
+            raise RuntimeError("Expected Signals 2.0 tables not all present")
+        print(prefix + "PASS (4 tables verified; no opportunity data written)", flush=True)
+        return True
+    except Exception as exc:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        # Do not log exception details; they could contain connection secrets.
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_MEMORY_SCHEMA_TEST_ON_START", "").lower().strip() == "true":
+            run_memory_schema_diagnostic()
 
         if os.environ.get("SIGNALS2_DATABASE_TEST_ON_START", "").lower().strip() == "true":
             run_read_only_database_diagnostic()
