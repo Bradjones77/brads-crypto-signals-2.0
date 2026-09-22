@@ -408,6 +408,8 @@ def run_memory_stage(
     try:
 
         combined_features = {}
+        technical_features = {}
+        market_features = {}
 
         technical = (
             opportunity.get(
@@ -483,8 +485,9 @@ def run_memory_stage(
                 direction=opportunity[
                     "direction"
                 ],
-                current_features=combined_features,
-                before_time=opportunity[
+                technical_features=technical_features if isinstance(technical_features, dict) else {},
+                market_features=market_features if isinstance(market_features, dict) else {},
+                opportunity_time=opportunity[
                     "observed_at"
                 ],
             )
@@ -1661,11 +1664,108 @@ def run_outcome_tracking_diagnostic():
                 pass
 
 
+
+# ============================================================
+# STEP 4.10: OPT-IN, ONE-SHOT PATTERN MEMORY DIAGNOSTIC
+# Read-only database check + in-memory synthetic calculation.
+# No synthetic database writes, Telegram, scanning or trades.
+# ============================================================
+def run_pattern_memory_diagnostic():
+    prefix = "PATTERN MEMORY DIAGNOSTIC: "
+    print(prefix + "START (read-only history; synthetic calculations only)", flush=True)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or memory_engine is None or pattern_memory is None):
+        print(prefix + "FAIL (safety flags or required module unavailable)", flush=True)
+        return False
+    connection = None
+    try:
+        from datetime import timedelta
+        import psycopg2
+        now = utc_now()
+        connection = memory_engine.connect()
+        connection.set_session(readonly=True, autocommit=False)
+        # Real historical analysis: pending observations must not count as evidence.
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT COUNT(*), COUNT(*) FILTER (WHERE r.outcome_complete = TRUE)
+                FROM signals2_opportunities o
+                JOIN signals2_outcomes r ON r.opportunity_id = o.opportunity_id
+                WHERE o.strategy_version = %s
+                  AND o.symbol IN ('BTCUSDT', 'ETHUSDT')
+            """, ("STEP4.8_MARKET_MEMORY_TEST",))
+            real_count, completed_count = cursor.fetchone()
+        if real_count != 4:
+            raise ValueError("Expected exactly four Step 4.8 observations")
+        print(prefix + "real observations=4; completed=" + str(completed_count), flush=True)
+        if completed_count > 4:
+            raise ValueError("Invalid completed outcome count")
+        # Test the actual database-backed matcher. It must not use the pending records.
+        real = pattern_memory.analyze_pattern_memory(
+            conn=connection, symbol="BTCUSDT", direction="LONG",
+            technical_features={}, market_features={}, opportunity_time=now)
+        if real.get("memory_usable") is not False or real.get("memory_score") is not None:
+            raise ValueError("Real memory should remain unavailable with insufficient evidence")
+        print(prefix + "real memory correctly unavailable (insufficient matches)", flush=True)
+        # Pure in-memory examples: exercise actual similarity, sample and scoring functions.
+        features = {name: 1.0 for name in list(pattern_memory.FEATURE_WEIGHTS)[:12]}
+        historical = []
+        for index in range(12):
+            historical.append({
+                "symbol": "BTCUSDT", "direction": "LONG",
+                "created_at": now - timedelta(days=index + 1),
+                "technical_features": features, "market_features": {},
+                "return_1m_pct": 0.2 if index % 3 else -0.1,
+                "direction_correct_1m": index % 3 != 0,
+                "return_5m_pct": 0.3 if index % 3 else -0.2,
+                "direction_correct_5m": index % 3 != 0,
+            })
+        matches = [pattern_memory.score_historical_match(
+            "BTCUSDT", "LONG", features, now, row) for row in historical]
+        if any(match is None for match in matches):
+            raise ValueError("Identical synthetic patterns did not match")
+        quality = pattern_memory.sample_quality(matches)
+        horizons = {h: pattern_memory.analyze_horizon(matches, h)
+                    for h in pattern_memory.OUTCOME_WEIGHTS}
+        score = pattern_memory.calculate_memory_evidence_score(horizons, quality)
+        if (not quality.get("memory_usable") or score is None or not (0 <= score <= 100)
+                or horizons["1m"]["sample_size"] != 12
+                or horizons["24h"]["sample_size"] != 0):
+            raise ValueError("Synthetic memory scoring or missing-horizon handling failed")
+        print(prefix + "synthetic 12 matches; effective_n=" +
+              str(quality["effective_sample_size"]) + "; score=" + str(score), flush=True)
+        # Opposite-direction records must not support a LONG prediction.
+        opposite = pattern_memory.score_historical_match(
+            "BTCUSDT", "LONG", features, now, dict(historical[0], direction="SHORT"))
+        if opposite is not None:
+            raise ValueError("Opposite direction incorrectly included")
+        # A future record must never support a historical prediction.
+        future = pattern_memory.score_historical_match(
+            "BTCUSDT", "LONG", features, now,
+            dict(historical[0], created_at=now + timedelta(days=1)))
+        if future is not None:
+            raise ValueError("Future record incorrectly included")
+        print(prefix + "PASS (real DB read-only; synthetic score valid; no sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        # Never log exception text: database exceptions may contain credentials.
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.rollback()
+                connection.close()
+            except Exception:
+                pass
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_PATTERN_MEMORY_TEST_ON_START", "").lower().strip() == "true":
+            run_pattern_memory_diagnostic()
 
         if os.environ.get("SIGNALS2_OUTCOME_TEST_ON_START", "").lower().strip() == "true":
             run_outcome_tracking_diagnostic()
