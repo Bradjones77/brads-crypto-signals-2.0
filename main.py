@@ -1968,11 +1968,51 @@ def run_step412_batch_memory_diagnostic():
                 pass
 
 
+# ============================================================
+# STEP 5.1: OPT-IN, SYNTHETIC, ONE-SHOT OPENAI DIAGNOSTIC
+# Never fetches prices, writes to the database, sends or trades.
+# ============================================================
+def run_ai_one_shot_diagnostic():
+    prefix = "AI ONE-SHOT DIAGNOSTIC: "
+    print(prefix + "START (synthetic evidence; at most one API call)", flush=True)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or ai_analyst is None):
+        print(prefix + "FAIL (safety flags or analyst unavailable)", flush=True)
+        return False
+    if os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() != "true":
+        print(prefix + "UNAVAILABLE (SIGNALS2_AI_ENABLED is not true)", flush=True)
+        return False
+    try:
+        result = ai_analyst.analyze_with_ai(
+            symbol="BTCUSDT", direction="LONG", current_price=100.0,
+            technical_analysis={"timeframes": {"1h": "synthetic mixed"}},
+            market_context={"regime": "synthetic uncertain"},
+            memory_analysis={"memory_usable": False},
+        )
+        if not isinstance(result, dict) or not result.get("available"):
+            reason = result.get("reasoning_summary", "unknown") if isinstance(result, dict) else "invalid result"
+            # Do not print request details, API keys or full response.
+            print(prefix + "UNAVAILABLE (" + str(reason)[:200] + ")", flush=True)
+            return False
+        score = result.get("ai_score")
+        if score is None or not 0 <= float(score) <= 100:
+            print(prefix + "FAIL (invalid evidence score)", flush=True)
+            return False
+        print(prefix + "PASS (structured response validated; no sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+
+
 if __name__ == "__main__":
 
     try:
 
         development_self_test()
+
+        if os.environ.get("SIGNALS2_AI_TEST_ON_START", "").strip().lower() == "true":
+            run_ai_one_shot_diagnostic()
 
         if os.environ.get("SIGNALS2_STEP412_TEST_ON_START", "").lower().strip() == "true":
             run_step412_batch_memory_diagnostic()
