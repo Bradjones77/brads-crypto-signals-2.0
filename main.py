@@ -2005,6 +2005,83 @@ def run_ai_one_shot_diagnostic():
         return False
 
 
+# ============================================================
+# STEP 5.5: OPT-IN REAL-MARKET AI DIAGNOSTIC
+# Exactly one BTCUSDT LONG analysis; no database, sends or trades.
+# WARNING: Startup opt-in can repeat on container restarts. Reset
+# BOTH flags immediately after the test.
+# ============================================================
+def run_real_market_ai_diagnostic():
+    prefix = "REAL MARKET AI DIAGNOSTIC: "
+    print(prefix + "START (BTCUSDT LONG; one AI request maximum)", flush=True)
+    required = (bitget_market, technical_analysis, market_context, ai_analyst,
+                confidence_engine)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or any(module is None for module in required)):
+        print(prefix + "FAIL (safety flags or missing module)", flush=True)
+        return False
+    if os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() != "true":
+        print(prefix + "UNAVAILABLE (AI connection disabled)", flush=True)
+        return False
+    try:
+        frames = ("5m", "15m", "30m", "1H", "4H", "1D")
+        analyses, prices = {}, {}
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            candles = bitget_market.get_multi_timeframe_candles(
+                symbol=symbol, timeframes=frames, limit=200)
+            if any(len(candles.get(frame, [])) < 55 for frame in frames):
+                raise ValueError("Insufficient closed candles for " + symbol)
+            analysis = technical_analysis.analyze_symbol(
+                symbol=symbol, multi_timeframe_candles=candles)
+            if not all(analysis.get("timeframes", {}).get(frame, {}).get("valid") for frame in frames):
+                raise ValueError("Invalid timeframe for " + symbol)
+            price = float(candles["5m"][-1]["close"])
+            if not __import__("math").isfinite(price) or price <= 0:
+                raise ValueError("Invalid closed price")
+            analyses[symbol], prices[symbol] = analysis, price
+        full_context = market_context.build_market_context(
+            btc_analysis=analyses["BTCUSDT"], eth_analysis=analyses["ETHUSDT"],
+            all_symbol_analyses=list(analyses.values()))
+        coin_context = market_context.build_coin_market_context(
+            coin_analysis=analyses["BTCUSDT"], btc_analysis=analyses["BTCUSDT"],
+            market_context=full_context, direction="LONG")
+        # Call the AI once directly, with real evidence and unavailable memory.
+        # Do not invoke the normal multi-opportunity controller or any storage.
+        result = ai_analyst.analyze_with_ai(
+            symbol="BTCUSDT", direction="LONG", current_price=prices["BTCUSDT"],
+            technical_analysis=analyses["BTCUSDT"], market_context=coin_context,
+            memory_analysis={"memory_usable": False, "memory_score": None})
+        if not isinstance(result, dict) or result.get("available") is not True:
+            print(prefix + "UNAVAILABLE (" + str(
+                result.get("reasoning_summary", "unknown") if isinstance(result, dict)
+                else "invalid result")[:180] + ")", flush=True)
+            return False
+        score = float(result.get("ai_score"))
+        if not __import__("math").isfinite(score) or not 0 <= score <= 100:
+            raise ValueError("Invalid AI evidence score")
+        confidence = confidence_engine.calculate_final_confidence(
+            symbol="BTCUSDT", direction="LONG",
+            technical_analysis=analyses["BTCUSDT"], market_context=coin_context,
+            memory_analysis={"memory_usable": False, "memory_score": None},
+            ai_result=result)
+        final_score = float(confidence.get("final_confidence", -1))
+        if not __import__("math").isfinite(final_score) or not 0 <= final_score <= 100:
+            raise ValueError("Invalid final confidence")
+        if confidence.get("eligible") and (final_score < MINIMUM_SIGNAL_CONFIDENCE
+                or confidence.get("evidence_gates", {}).get("passed") is not True):
+            raise ValueError("Confidence safety gate violation")
+        print(prefix + "AI available; evidence_score=" + str(round(score, 2)) +
+              "; final_confidence=" + str(round(final_score, 2)) +
+              "; eligible=" + str(bool(confidence.get("eligible"))) +
+              "; decision=" + str(confidence.get("decision")), flush=True)
+        print(prefix + "PASS (one real-market analysis; no database writes, sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        # No exception detail: request exceptions could contain credentials.
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+
+
 if __name__ == "__main__":
 
     try:
@@ -2013,6 +2090,9 @@ if __name__ == "__main__":
 
         if os.environ.get("SIGNALS2_AI_TEST_ON_START", "").strip().lower() == "true":
             run_ai_one_shot_diagnostic()
+
+        if os.environ.get("SIGNALS2_REAL_AI_TEST_ON_START", "").strip().lower() == "true":
+            run_real_market_ai_diagnostic()
 
         if os.environ.get("SIGNALS2_STEP412_TEST_ON_START", "").lower().strip() == "true":
             run_step412_batch_memory_diagnostic()
