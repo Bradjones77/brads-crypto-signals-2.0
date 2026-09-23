@@ -1,5 +1,8 @@
 import json
 import math
+import os
+import urllib.request
+import urllib.error
 from typing import Dict, Any, Optional, List
 
 
@@ -45,7 +48,12 @@ from typing import Dict, Any, Optional, List
 # ============================================================
 
 
-AI_ANALYST_VERSION = "2.0"
+AI_ANALYST_VERSION = "2.0.1"
+
+# Explicit opt-in required for every API call. No automatic live use.
+AI_ENABLED_FLAG = "SIGNALS2_AI_ENABLED"
+AI_TEST_FLAG = "SIGNALS2_AI_TEST_ON_START"
+
 
 
 # ============================================================
@@ -1181,24 +1189,79 @@ def analyze_with_ai(
         )
     )
 
-    # --------------------------------------------------------
-    # API CONNECTION WILL BE ADDED DURING FINAL INTEGRATION.
-    #
-    # For now we return a safe unavailable result rather than
-    # inventing AI analysis.
-    # --------------------------------------------------------
+    result = unavailable_ai_result("AI disabled by default.")
+    if os.getenv(AI_ENABLED_FLAG, "false").strip().lower() != "true":
+        result["evidence_package"] = evidence_package
+        return result
 
-    result = (
-        unavailable_ai_result(
-            "AI connection intentionally not configured yet."
-        )
-    )
+    # Bound payload, one request, no retries, and a strict timeout.
+    if evidence_package["current_price"] is None or evidence_package["current_price"] <= 0:
+        result = unavailable_ai_result("Invalid current price.")
+    elif evidence_package["proposed_direction"] not in ("LONG", "SHORT"):
+        result = unavailable_ai_result("Invalid direction.")
+    elif not evidence_package["technical_evidence"] or not evidence_package["market_evidence"]:
+        result = unavailable_ai_result("Insufficient technical or market evidence.")
+    else:
+        result = _request_openai(evidence_package)
 
     result[
         "evidence_package"
     ] = evidence_package
 
     return result
+
+
+# ============================================================
+# OPT-IN OPENAI REQUEST — ONE CALL, NO AUTOMATIC RETRIES
+# ============================================================
+
+
+def _request_openai(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        return unavailable_ai_result("OPENAI_API_KEY not configured.")
+
+    # Fixed model and fixed output budget prevent env-driven cost escalation.
+    model = "gpt-4o-mini"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": build_system_prompt()},
+            {"role": "user", "content": build_user_prompt(evidence_package)},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_tokens": 900,
+    }
+    try:
+        body = json.dumps(payload, allow_nan=False).encode("utf-8")
+        if len(body) > 24000:
+            return unavailable_ai_result("Evidence package exceeds 24 KB request limit.")
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=body,
+            headers={"Authorization": "Bearer " + key,
+                     "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read(32769)
+        if len(raw) > 32768:
+            return unavailable_ai_result("AI response exceeds size limit.")
+        envelope = json.loads(raw.decode("utf-8"))
+        choices = envelope.get("choices", [])
+        if not choices or choices[0].get("finish_reason") != "stop":
+            return unavailable_ai_result("AI response incomplete or refused.")
+        content = choices[0].get("message", {}).get("content")
+        result = parse_ai_json(content)
+        # Never log credentials, full response envelopes, or raw market evidence.
+        return result
+    except urllib.error.HTTPError as exc:
+        return unavailable_ai_result("AI HTTP error (status %s)." % exc.code)
+    except (urllib.error.URLError, TimeoutError):
+        return unavailable_ai_result("AI connection failed or timed out.")
+    except (ValueError, KeyError, TypeError, UnicodeError, OSError):
+        return unavailable_ai_result("AI response or request processing failed.")
 
 
 # ============================================================
@@ -1359,10 +1422,21 @@ if __name__ == "__main__":
         flush=True,
     )
 
-    print(
-        "OPENAI CONNECTION: DEFERRED",
-        flush=True,
-    )
+    print("OPENAI CONNECTION: OPT-IN ONLY", flush=True)
+    if os.getenv(AI_TEST_FLAG, "false").strip().lower() == "true":
+        # Synthetic data only: not a real trading signal or performance record.
+        diagnostic = analyze_with_ai(
+            symbol="BTCUSDT", direction="LONG", current_price=100.0,
+            technical_analysis={"timeframes": {"1h": "synthetic mixed"}},
+            market_context={"regime": "synthetic uncertain"},
+            memory_analysis={"memory_usable": False},
+        )
+        print("AI ONE-SHOT DIAGNOSTIC: " +
+              ("PASS" if diagnostic.get("available") else "UNAVAILABLE"), flush=True)
+        print("AI DIAGNOSTIC REASON: " +
+              ("valid structured response" if diagnostic.get("available") else
+               diagnostic.get("reasoning_summary", "unknown")), flush=True)
+        print("AI DIAGNOSTIC: SYNTHETIC ONLY; NO SENDS OR TRADES", flush=True)
 
     print(
         "NO TRADE EXECUTION CODE",
