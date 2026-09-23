@@ -2091,7 +2091,7 @@ if __name__ == "__main__":
         if os.environ.get("SIGNALS2_AI_TEST_ON_START", "").strip().lower() == "true":
             run_ai_one_shot_diagnostic()
 
-        if os.environ.get("SIGNALS2_REAL_AI_TEST_ON_START", "").strip().lower() == "true":
+        if os.environ.get("SIGNALS2_AI_REAL_MARKET_TEST_ON_START", "").strip().lower() == "true":
             run_real_market_ai_diagnostic()
 
         if os.environ.get("SIGNALS2_STEP412_TEST_ON_START", "").lower().strip() == "true":
