@@ -1693,6 +1693,50 @@ def run_one_off_observation_collection():
                 pass
 
 
+# ============================================================
+# CONTROLLED AUTOMATIC OBSERVATION COLLECTOR (OPT-IN)
+# Default: ONE cycle only. Continuous mode requires explicit opt-in.
+# Uses the already verified one-off collector, including its DB lock,
+# five-minute candle identity, six-timeframe checks and readback.
+# ============================================================
+def run_automatic_observation_collector():
+    import time
+    prefix = "AUTO OBSERVATION: "
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"):
+        print(prefix + "BLOCKED (safety settings; AI must be disabled)", flush=True)
+        return False
+    continuous = os.environ.get("SIGNALS2_AUTO_OBSERVATION_CONTINUOUS", "").strip().lower() == "true"
+    # Never start an unbounded loop by simply enabling the test switch.
+    max_cycles = 0 if continuous else 1
+    print(prefix + ("START (continuous, five-minute boundaries)" if continuous else
+                    "START (one scheduled cycle only)"), flush=True)
+    cycles = 0
+    while max_cycles == 0 or cycles < max_cycles:
+        # Start 30 seconds after the next UTC five-minute boundary to allow
+        # Bitget to publish the just-closed candle. No requests during sleep.
+        now = time.time()
+        next_boundary = (int(now) // 300 + 1) * 300
+        wait = max(0.0, next_boundary + 30 - now)
+        print(prefix + "WAIT (" + str(int(wait)) + " seconds until next closed candle)", flush=True)
+        time.sleep(wait)
+        # Recheck safety before every cycle, including after a long wait.
+        if (LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED or
+                os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"):
+            print(prefix + "STOPPED (safety settings changed)", flush=True)
+            return False
+        cycles += 1
+        print(prefix + "CYCLE " + str(cycles) + ": START", flush=True)
+        try:
+            passed = run_one_off_observation_collection()
+        except Exception as exc:
+            print(prefix + "CYCLE " + str(cycles) + ": FAIL (" + type(exc).__name__ + ")", flush=True)
+            passed = False
+        print(prefix + "CYCLE " + str(cycles) + ": " + ("PASS" if passed else "SKIPPED_OR_FAILED"), flush=True)
+    print(prefix + "STOPPED (one scheduled cycle completed; no sends or trades)", flush=True)
+    return True
+
+
 def run_market_memory_diagnostic():
     prefix = "MARKET MEMORY DIAGNOSTIC: "
     print(prefix + "START (4 market observations; database writes; no sends or trades)", flush=True)
@@ -2253,6 +2297,9 @@ if __name__ == "__main__":
 
         if os.environ.get("SIGNALS2_OBSERVATION_COLLECTION_TEST_ON_START", "").lower().strip() == "true":
             run_one_off_observation_collection()
+
+        if os.environ.get("SIGNALS2_AUTO_OBSERVATION_TEST_ON_START", "").lower().strip() == "true":
+            run_automatic_observation_collector()
 
         if os.environ.get("SIGNALS2_MARKET_MEMORY_TEST_ON_START", "").lower().strip() == "true":
             run_market_memory_diagnostic()
