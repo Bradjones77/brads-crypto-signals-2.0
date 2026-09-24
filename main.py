@@ -1548,6 +1548,151 @@ def run_memory_storage_diagnostic():
 # Real public candles; saves four LONG/SHORT observations, including
 # rejected candidates. No Telegram delivery or trade execution.
 # ============================================================
+
+# ============================================================
+# ONE-OFF OBSERVATION COLLECTION (OPT-IN; NO SENDS OR TRADES)
+# ============================================================
+
+def run_one_off_observation_collection():
+    """Collect BTC/ETH LONG/SHORT once, with completed-candle validation.
+
+    The five-minute candle timestamp is the observation identity. A database
+    advisory lock prevents concurrent copies of this diagnostic from racing.
+    This is not a continuous scanner or a Telegram delivery test.
+    """
+    prefix = "OBSERVATION COLLECTION DIAGNOSTIC: "
+    print(prefix + "START (one batch; no Telegram sends or trades)", flush=True)
+    required = (bitget_market, technical_analysis, market_context,
+                memory_engine, pattern_memory, confidence_engine,
+                signal_selector, telegram_formatter)
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or any(module is None for module in required)):
+        print(prefix + "FAIL (safety flags or module unavailable)", flush=True)
+        return False
+    # Avoid surprise paid AI requests in this initial memory-connection test.
+    if os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true":
+        print(prefix + "SKIPPED (set SIGNALS2_AI_ENABLED=false for this test)", flush=True)
+        return False
+    conn = None
+    lock_acquired = False
+    try:
+        from datetime import timedelta
+        import math
+        frames = ("5m", "15m", "30m", "1H", "4H", "1D")
+        analyses, candles_by_symbol, prices, candle_times = {}, {}, {}, {}
+        # Fetch and validate *all* input data before any database write.
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            candles = bitget_market.get_multi_timeframe_candles(
+                symbol=symbol, timeframes=frames, limit=200)
+            if any(len(candles.get(frame, [])) < 55 for frame in frames):
+                raise ValueError("Insufficient closed candle history: " + symbol)
+            analysis = technical_analysis.analyze_symbol(
+                symbol=symbol, multi_timeframe_candles=candles)
+            if not all(analysis.get("timeframes", {}).get(frame, {}).get("valid")
+                       for frame in frames):
+                raise ValueError("Invalid timeframe analysis: " + symbol)
+            price = float(candles["5m"][-1]["close"])
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("Invalid price: " + symbol)
+            stamp = int(candles["5m"][-1]["timestamp"])
+            if stamp <= 0 or stamp % 300000:
+                raise ValueError("Invalid five-minute candle timestamp")
+            analyses[symbol], candles_by_symbol[symbol] = analysis, candles
+            prices[symbol], candle_times[symbol] = price, stamp
+        if len(set(candle_times.values())) != 1:
+            raise ValueError("BTC and ETH snapshots refer to different five-minute candles")
+        # Observed time is the close of the common last fully closed 5m candle.
+        observed_at = datetime.fromtimestamp(
+            (next(iter(candle_times.values())) + 300000) / 1000, tz=timezone.utc)
+        context = market_context.build_market_context(
+            btc_analysis=analyses["BTCUSDT"], eth_analysis=analyses["ETHUSDT"],
+            all_symbol_analyses=list(analyses.values()))
+        conn = memory_engine.connect()
+        # PostgreSQL session-level advisory lock, released in finally.
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (220250925,))
+            lock_acquired = bool(cur.fetchone()[0])
+        if not lock_acquired:
+            print(prefix + "SKIPPED (another collection is running)", flush=True)
+            return False
+        with conn.cursor() as cur:
+            cur.execute("""SELECT symbol, direction FROM signals2_opportunities
+                           WHERE symbol IN ('BTCUSDT', 'ETHUSDT')
+                             AND created_at >= %s AND created_at < %s""",
+                        (observed_at, observed_at + timedelta(minutes=5)))
+            existing = {(str(row[0]), str(row[1])) for row in cur.fetchall()}
+        expected = {(symbol, direction) for symbol in ("BTCUSDT", "ETHUSDT")
+                    for direction in ("LONG", "SHORT")}
+        if existing & expected:
+            print(prefix + "SKIPPED (this five-minute candle already has observations)", flush=True)
+            return False
+        opportunities = []
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            for direction in ("LONG", "SHORT"):
+                coin_context = market_context.build_coin_market_context(
+                    coin_analysis=analyses[symbol], btc_analysis=analyses["BTCUSDT"],
+                    market_context=context, direction=direction)
+                opportunity = analyse_opportunity(
+                    symbol=symbol, direction=direction, current_price=prices[symbol],
+                    multi_timeframe_candles=candles_by_symbol[symbol],
+                    full_market_context=coin_context, database_connection=conn,
+                    observed_at=observed_at)
+                confidence = opportunity.get("confidence_result") or {}
+                score = float(confidence.get("final_confidence"))
+                if not math.isfinite(score) or not 0 <= score <= 100:
+                    raise ValueError("Invalid confidence score")
+                if (confidence.get("component_scores") or {}).get("technical") is None:
+                    raise ValueError("Missing technical confidence")
+                if confidence.get("eligible") and (
+                        score < MINIMUM_SIGNAL_CONFIDENCE or
+                        (confidence.get("evidence_gates") or {}).get("passed") is not True):
+                    raise ValueError("Confidence eligibility gate violation")
+                opportunities.append(opportunity)
+        batch = process_analysis_batch(opportunities, recent_signal_times={})
+        if batch.get("opportunity_count") != 4:
+            raise ValueError("Expected exactly four observations")
+        result = store_analysis_batch(batch, database_connection=conn)
+        if not result.get("stored") or result.get("count") != 4:
+            raise RuntimeError("Observation storage incomplete")
+        for opportunity, record_id in zip(opportunities, result["opportunity_ids"]):
+            record = memory_engine.get_opportunity(conn, record_id)
+            if (not record or record.get("signal_sent") is not False
+                    or record.get("symbol") != opportunity["symbol"]
+                    or record.get("direction") != opportunity["direction"]):
+                raise RuntimeError("Stored observation readback mismatch")
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM signals2_outcomes WHERE opportunity_id=%s",
+                            (record_id,))
+                if cur.fetchone()[0] != 1:
+                    raise RuntimeError("Missing outcome record")
+            print(prefix + opportunity["symbol"] + " " + opportunity["direction"] +
+                  "; confidence=" + str(opportunity["confidence_result"]["final_confidence"]) +
+                  "; memory_usable=" + str(bool((opportunity.get("memory_analysis") or {}).get("memory_usable"))) +
+                  "; sent=False", flush=True)
+        print(prefix + "PASS (4 observations and outcome rows verified; no sends or trades)", flush=True)
+        return True
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print(prefix + "FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+    finally:
+        if conn is not None:
+            if lock_acquired:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT pg_advisory_unlock(%s)", (220250925,))
+                except Exception:
+                    pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def run_market_memory_diagnostic():
     prefix = "MARKET MEMORY DIAGNOSTIC: "
     print(prefix + "START (4 market observations; database writes; no sends or trades)", flush=True)
@@ -2105,6 +2250,9 @@ if __name__ == "__main__":
 
         if os.environ.get("SIGNALS2_OUTCOME_TEST_ON_START", "").lower().strip() == "true":
             run_outcome_tracking_diagnostic()
+
+        if os.environ.get("SIGNALS2_OBSERVATION_COLLECTION_TEST_ON_START", "").lower().strip() == "true":
+            run_one_off_observation_collection()
 
         if os.environ.get("SIGNALS2_MARKET_MEMORY_TEST_ON_START", "").lower().strip() == "true":
             run_market_memory_diagnostic()
