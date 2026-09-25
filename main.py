@@ -1741,6 +1741,114 @@ def run_automatic_observation_collector():
     return True
 
 
+# ============================================================
+# HOURLY MEMORY LEARNING LOOP (OPT-IN)
+# Collects one BTC/ETH LONG/SHORT observation batch per hour and then
+# completes mature outcomes once they are at least 24h + 5m old.
+# This avoids the old five-minute continuous collector (~1,152 rows/day).
+# No Telegram sends, live scanning, AI calls or trade execution.
+# ============================================================
+def run_hourly_memory_learning_loop():
+    import time
+    prefix = "HOURLY MEMORY LOOP: "
+    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
+            or os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"):
+        print(prefix + "BLOCKED (safety settings; AI must be disabled)", flush=True)
+        return False
+    if memory_engine is None or outcome_tracker is None:
+        print(prefix + "BLOCKED (memory/outcome module unavailable)", flush=True)
+        return False
+
+    print(prefix + "START (hourly; 4 observations/cycle; mature outcomes only; no sends or trades)", flush=True)
+    cycle = 0
+    while True:
+        # Run 30 seconds after the next UTC hour so the latest closed candles
+        # are available from Bitget. Sleeping performs no API or DB activity.
+        now = time.time()
+        next_hour = (int(now) // 3600 + 1) * 3600
+        wait = max(0.0, next_hour + 30 - now)
+        print(prefix + "WAIT (" + str(int(wait)) + " seconds until next hourly cycle)", flush=True)
+        time.sleep(wait)
+
+        if (LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED or
+                os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"):
+            print(prefix + "STOPPED (safety settings changed)", flush=True)
+            return False
+
+        cycle += 1
+        print(prefix + "CYCLE " + str(cycle) + ": START", flush=True)
+
+        try:
+            collected = run_one_off_observation_collection()
+            print(prefix + "CYCLE " + str(cycle) + ": COLLECTION " +
+                  ("PASS" if collected else "SKIPPED_OR_FAILED"), flush=True)
+        except Exception as exc:
+            print(prefix + "CYCLE " + str(cycle) + ": COLLECTION FAIL (" +
+                  type(exc).__name__ + ")", flush=True)
+
+        connection = None
+        lock_acquired = False
+        try:
+            connection = memory_engine.connect()
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(%s)", (220250926,))
+                lock_acquired = bool(cursor.fetchone()[0])
+            if not lock_acquired:
+                print(prefix + "CYCLE " + str(cycle) + ": OUTCOMES SKIPPED (another updater is running)", flush=True)
+                continue
+
+            # Only touch observations old enough for the final 24h checkpoint.
+            # A small 5m buffer avoids asking for a candle that may not yet be closed.
+            with connection.cursor(cursor_factory=__import__(
+                    "psycopg2.extras", fromlist=["RealDictCursor"]).RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT r.*
+                    FROM signals2_outcomes r
+                    WHERE r.outcome_complete = FALSE
+                      AND r.opportunity_time <= (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours 5 minutes'
+                    ORDER BY r.opportunity_time ASC
+                    LIMIT 24
+                """)
+                records = [dict(row) for row in cursor.fetchall()]
+
+            updated = completed = waiting = 0
+            for record in records:
+                result = outcome_tracker.update_one_outcome(connection, record)
+                updated += int(bool(result.get("updated")))
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT outcome_complete FROM signals2_outcomes WHERE opportunity_id=%s",
+                                   (record["opportunity_id"],))
+                    row = cursor.fetchone()
+                is_complete = bool(row and row[0])
+                completed += int(is_complete)
+                waiting += int(not is_complete)
+
+            print(prefix + "CYCLE " + str(cycle) + ": OUTCOMES checked=" +
+                  str(len(records)) + "; updated=" + str(updated) +
+                  "; completed=" + str(completed) + "; waiting=" + str(waiting), flush=True)
+            print(prefix + "CYCLE " + str(cycle) + ": PASS (no sends or trades)", flush=True)
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            print(prefix + "CYCLE " + str(cycle) + ": OUTCOMES FAIL (" +
+                  type(exc).__name__ + ")", flush=True)
+        finally:
+            if connection is not None:
+                if lock_acquired:
+                    try:
+                        with connection.cursor() as cursor:
+                            cursor.execute("SELECT pg_advisory_unlock(%s)", (220250926,))
+                    except Exception:
+                        pass
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+
 def run_market_memory_diagnostic():
     prefix = "MARKET MEMORY DIAGNOSTIC: "
     print(prefix + "START (4 market observations; database writes; no sends or trades)", flush=True)
@@ -2304,6 +2412,9 @@ if __name__ == "__main__":
 
         if os.environ.get("SIGNALS2_AUTO_OBSERVATION_TEST_ON_START", "").lower().strip() == "true":
             run_automatic_observation_collector()
+
+        if os.environ.get("SIGNALS2_HOURLY_MEMORY_LOOP_ON_START", "").lower().strip() == "true":
+            run_hourly_memory_learning_loop()
 
         if os.environ.get("SIGNALS2_MARKET_MEMORY_TEST_ON_START", "").lower().strip() == "true":
             run_market_memory_diagnostic()
