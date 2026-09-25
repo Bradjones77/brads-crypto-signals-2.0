@@ -136,9 +136,13 @@ try:
 
     import ai_analyst
 
-except Exception:
+except Exception as exc:
 
     ai_analyst = None
+    print(
+        "AI ANALYST IMPORT ERROR: " + type(exc).__name__ + ": " + str(exc),
+        flush=True,
+    )
 
 
 try:
