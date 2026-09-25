@@ -48,7 +48,7 @@ from typing import Dict, Any, Optional, List
 # ============================================================
 
 
-AI_ANALYST_VERSION = "2.0.1"
+AI_ANALYST_VERSION = "2.1.0"
 
 # Explicit opt-in required for every API call. No automatic live use.
 AI_ENABLED_FLAG = "SIGNALS2_AI_ENABLED"
@@ -442,6 +442,20 @@ def build_memory_summary(
             False,
         }
 
+    # An insufficient sample must never be presented as positive historical evidence.
+    if memory_analysis.get("memory_usable") is not True:
+        return {
+            "memory_available": False,
+            "memory_score": None,
+            "sample_quality": make_json_safe(memory_analysis.get("sample_quality", {})),
+            "same_symbol_matches": memory_analysis.get("same_symbol_matches"),
+            "cross_symbol_matches": memory_analysis.get("cross_symbol_matches"),
+            "horizons": {},
+            "excursions": {},
+            "early_behaviour": {},
+            "top_historical_matches": [],
+        }
+
     return {
 
         "memory_available":
@@ -804,45 +818,16 @@ def validate_ai_response(
             "AI returned invalid data."
         )
 
-    ai_score = safe_float(
-        response.get(
-            "ai_score"
-        )
-    )
-
-    if ai_score is None:
-
-        return unavailable_ai_result(
-            "AI response did not contain a valid score."
-        )
-
-    ai_score = clamp(
-        ai_score,
-        MIN_AI_SCORE,
-        MAX_AI_SCORE,
-    )
-
-    data_quality = clamp(
-        safe_float(
-            response.get(
-                "data_quality"
-            ),
-            50.0,
-        ),
-        0.0,
-        100.0,
-    )
-
-    uncertainty = clamp(
-        safe_float(
-            response.get(
-                "uncertainty"
-            ),
-            50.0,
-        ),
-        0.0,
-        100.0,
-    )
+    # Fail closed: all numerical fields are required and must be within range.
+    numbers = {}
+    for field in ("ai_score", "data_quality", "uncertainty"):
+        value = safe_float(response.get(field))
+        if value is None or not 0.0 <= value <= 100.0:
+            return unavailable_ai_result("AI response has missing or invalid " + field + ".")
+        numbers[field] = value
+    ai_score = numbers["ai_score"]
+    data_quality = numbers["data_quality"]
+    uncertainty = numbers["uncertainty"]
 
     setup_quality = (
         clean_text(
@@ -1204,6 +1189,12 @@ def analyze_with_ai(
     else:
         result = _request_openai(evidence_package)
 
+    if result.get("available") and not evidence_package["historical_memory"].get("memory_available"):
+        # Reject contradictory model claims rather than silently trusting them.
+        if (result.get("historical_support") != "INSUFFICIENT_DATA"
+                or result.get("historical_supporting_points")):
+            result = unavailable_ai_result("AI claimed support from unusable historical memory.")
+
     result[
         "evidence_package"
     ] = evidence_package
@@ -1441,4 +1432,3 @@ if __name__ == "__main__":
     print(
         "NO TRADE EXECUTION CODE",
         flush=True,
-    )
