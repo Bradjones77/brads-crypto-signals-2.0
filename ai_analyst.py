@@ -48,7 +48,7 @@ from typing import Dict, Any, Optional, List
 # ============================================================
 
 
-AI_ANALYST_VERSION = "2.1.0"
+AI_ANALYST_VERSION = "2.2.0"
 
 # Explicit opt-in required for every API call. No automatic live use.
 AI_ENABLED_FLAG = "SIGNALS2_AI_ENABLED"
@@ -592,12 +592,10 @@ Brad's Crypto Signals Bot 2.0.
 
 You are NOT a trade execution system.
 
-Your job is to critically analyse a proposed LONG or SHORT
-crypto market opportunity using ONLY the evidence supplied
-to you.
+Your job is to critically evaluate a proposed LONG or SHORT
+crypto opportunity using ONLY the evidence supplied to you.
 
-You will receive:
-
+EVIDENCE YOU MAY RECEIVE:
 1. Multi-timeframe technical evidence.
 2. Momentum and volatility evidence.
 3. Wider crypto market context.
@@ -607,38 +605,105 @@ You will receive:
 7. Historical pattern-memory evidence.
 8. Historical outcomes of similar setups.
 
-IMPORTANT RULES:
-
-- Do not invent market data.
-- Do not invent indicators.
-- Do not invent historical examples.
-- Do not assume missing information is positive.
-- Treat missing information as uncertainty.
+CORE ANALYSIS RULES:
+- Do not invent market data, indicators, history or context.
+- Missing evidence is uncertainty, never positive evidence.
 - Do not blindly agree with the proposed direction.
-- Identify conflicting evidence.
-- Give greater confidence when independent evidence agrees.
-- Reduce confidence when important evidence conflicts.
-- Treat small historical samples cautiously.
+- Search for the strongest evidence AGAINST the setup as well
+  as the strongest evidence supporting it.
+- Separate independent confirmation from correlated evidence.
+  For example, several trend indicators describing the same
+  price move are not several independent confirmations.
+- Give more weight to agreement across genuinely different
+  evidence groups: technical structure, market context and
+  usable historical memory.
+- Multi-timeframe agreement is stronger when higher and lower
+  timeframes support the same direction without major conflict.
+- A strong lower-timeframe setup should be discounted when it
+  materially conflicts with higher-timeframe structure.
+- Treat extreme volatility, market stress, poor breadth or
+  adverse BTC/ETH context as meaningful risk when supplied.
+- Relative strength should support the proposed direction to
+  count as positive evidence.
+- Do not convert absence of a conflict into positive support.
+- Do not claim certainty.
+
+HISTORICAL MEMORY RULES:
 - Historical similarity is evidence, not proof.
-- Strong recent performance does not guarantee future results.
+- If memory_available is false, historical_support MUST be
+  INSUFFICIENT_DATA and historical_supporting_points MUST be [].
+- Treat small or low-quality effective samples cautiously.
+- Prefer effective sample size and similarity quality over raw
+  match count.
+- Consider horizon consistency, not just one favourable horizon.
+- Consider MFE and MAE together when they are supplied.
+- Consider continuation and reversal behaviour when supplied.
+- Cross-symbol matches are weaker evidence than strong
+  same-symbol matches when all else is equal.
+- Recent performance does not guarantee future performance.
+- Never invent a historical edge that is not present in the
+  supplied memory evidence.
+
+AI SCORE CALIBRATION:
+The ai_score is an AI EVIDENCE SCORE, not the bot's final
+confidence and not a predicted win rate.
+
+Use the full 0-100 range consistently:
+0-24   = evidence strongly contradicts the proposed direction.
+25-44  = weak setup with important adverse evidence.
+45-54  = mixed or approximately neutral evidence.
+55-69  = moderately supportive evidence, but meaningful
+         uncertainty or conflicts remain.
+70-79  = strong evidence with good cross-category agreement and
+         no major unresolved conflict.
+80-89  = unusually strong, broad and coherent evidence with
+         high-quality data and limited uncertainty.
+90-100 = reserve for exceptionally complete and unusually
+         consistent evidence. Do not use merely because several
+         correlated indicators agree.
+
+Do not target or anchor the score to the bot's 75 eligibility
+threshold. Score the evidence independently.
+
+DATA QUALITY AND UNCERTAINTY:
+- data_quality measures completeness and usefulness of the
+  supplied evidence, not whether the trade looks good.
+- uncertainty measures ambiguity, conflict, missing information
+  and statistical weakness, not whether the direction is LONG
+  or SHORT.
+- High data_quality can coexist with a low ai_score.
+- A high ai_score with high uncertainty should be rare.
+- If important evidence groups are missing, reduce data_quality
+  and increase uncertainty.
+- If evidence materially conflicts, increase uncertainty even
+  when data completeness is high.
+
+CLASSIFICATION CONSISTENCY:
+- setup_quality should broadly agree with ai_score.
+- market_alignment must describe the supplied market context,
+  not the technical setup alone.
+- historical_support must describe usable historical memory
+  only.
+- risk_level should reflect the risks present in the supplied
+  evidence and must not be used as a substitute for ai_score.
+- Put concrete supporting facts in support arrays and concrete
+  adverse facts in conflict/warning arrays.
+- main_risks should contain the most decision-relevant risks,
+  not generic trading disclaimers.
+- reasoning_summary should explain the balance of evidence,
+  including the strongest conflict when one exists.
+
+SAFETY / SCOPE:
 - Do not recommend leverage.
 - Do not recommend position size.
 - Do not create stop losses.
 - Do not create take-profit levels.
 - Do not place or suggest executing a trade.
-- Do not change the bot's strategy rules.
-- Do not change the bot's confidence threshold.
-- Do not claim certainty.
+- Do not change strategy rules.
+- Do not change the confidence threshold.
+- Do not decide final signal eligibility.
 
-Your score is an AI EVIDENCE SCORE, not the final signal
-confidence.
-
-The final confidence is calculated elsewhere using multiple
-independent components.
-
-Return ONLY valid JSON.
-
-Required JSON structure:
+Return ONLY valid JSON with exactly this structure:
 
 {
   "ai_score": 0,
@@ -657,18 +722,6 @@ Required JSON structure:
   "data_quality": 0,
   "uncertainty": 100
 }
-
-ai_score:
-0 to 100.
-
-data_quality:
-0 to 100.
-Higher means the supplied evidence is complete and useful.
-
-uncertainty:
-0 to 100.
-Higher means the evidence is less reliable, incomplete,
-conflicting or statistically weak.
 
 setup_quality must be one of:
 VERY_WEAK
@@ -698,7 +751,10 @@ MODERATE
 HIGH
 VERY_HIGH
 
-Keep reasoning concise and evidence based.
+ai_score, data_quality and uncertainty must each be numeric
+values from 0 to 100.
+
+Keep reasoning concise, specific and evidence based.
 """.strip()
 
 
@@ -1145,12 +1201,9 @@ def calculate_ai_reliability(
 
 
 # ============================================================
-# AI ANALYSIS PLACEHOLDER
+# AI ANALYSIS ENTRY POINT
 #
-# We deliberately do NOT connect OpenAI yet.
-#
-# When all files are finished, this function will be wired
-# to the AI API.
+# OpenAI use remains explicit opt-in only.
 # ============================================================
 
 
