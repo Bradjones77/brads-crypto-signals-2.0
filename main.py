@@ -2495,12 +2495,30 @@ def run_controlled_market_scanner():
             if not tradeable or not tickers:
                 raise RuntimeError("Bitget market universe unavailable")
 
+            # Safety eligibility layer. Bitget's USDT futures universe can
+            # contain non-standard/tokenized markets alongside ordinary crypto
+            # perpetuals. Exclude known unwanted markets and allow the list to
+            # be extended from Railway without changing code.
+            default_excluded = {"SOXLUSDT", "SNDKUSDT"}
+            configured_excluded = {
+                item.strip().upper()
+                for item in os.environ.get(
+                    "SIGNALS2_SCANNER_EXCLUDED_SYMBOLS", ""
+                ).split(",")
+                if item.strip()
+            }
+            excluded_symbols = default_excluded | configured_excluded
+
             ranked = []
+            excluded_count = 0
             for ticker in tickers:
                 if not isinstance(ticker, dict):
                     continue
                 symbol = str(ticker.get("symbol") or "").upper().strip()
                 if symbol not in tradeable or not symbol.endswith("USDT"):
+                    continue
+                if symbol in excluded_symbols:
+                    excluded_count += 1
                     continue
                 try:
                     # Bitget futures ticker payloads expose USDT turnover as
@@ -2545,7 +2563,8 @@ def run_controlled_market_scanner():
 
             print(
                 prefix + "DISCOVERY universe=" + str(len(tradeable)) +
-                "; ticker_matches=" + str(len(ranked)) +
+                "; eligible_tickers=" + str(len(ranked)) +
+                "; excluded=" + str(excluded_count) +
                 "; candidates=" + str(len(candidate_symbols)) +
                 "; top=" + ",".join(candidate_symbols),
                 flush=True,
