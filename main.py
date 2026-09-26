@@ -2468,7 +2468,7 @@ def run_controlled_market_scanner():
     print(
         prefix + "START (" +
         ("continuous; " + str(interval) + "s interval" if continuous else "one cycle") +
-        "; BTCUSDT/ETHUSDT; Telegram OFF; no trades)",
+        "; dynamic Bitget USDT futures; Telegram OFF; no trades)",
         flush=True,
     )
 
@@ -2486,14 +2486,78 @@ def run_controlled_market_scanner():
                 raise RuntimeError("Safety flags changed")
 
             frames = ("5m", "15m", "30m", "1H", "4H", "1D")
-            symbols = ("BTCUSDT", "ETHUSDT")
+
+            # Discover the current Bitget USDT perpetual universe dynamically.
+            # Use the exchange ticker snapshot only as a cheap liquidity prefilter;
+            # the full six-timeframe analysis is still the source of signal evidence.
+            tradeable = set(bitget_market.get_tradeable_symbols() or [])
+            tickers = bitget_market.get_all_futures_tickers() or []
+            if not tradeable or not tickers:
+                raise RuntimeError("Bitget market universe unavailable")
+
+            ranked = []
+            for ticker in tickers:
+                if not isinstance(ticker, dict):
+                    continue
+                symbol = str(ticker.get("symbol") or "").upper().strip()
+                if symbol not in tradeable or not symbol.endswith("USDT"):
+                    continue
+                try:
+                    # Bitget futures ticker payloads expose USDT turnover as
+                    # usdtVolume on current API versions. Fall back safely to
+                    # quoteVolume/turnover if present; malformed values rank last.
+                    liquidity = float(
+                        ticker.get("usdtVolume")
+                        or ticker.get("quoteVolume")
+                        or ticker.get("turnover")
+                        or 0.0
+                    )
+                except Exception:
+                    liquidity = 0.0
+                if not math.isfinite(liquidity) or liquidity < 0:
+                    liquidity = 0.0
+                ranked.append((liquidity, symbol))
+
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            try:
+                max_candidates = int(os.environ.get(
+                    "SIGNALS2_SCANNER_MAX_CANDIDATES", "10"
+                ))
+            except Exception:
+                max_candidates = 10
+            max_candidates = max(2, min(max_candidates, 25))
+
+            candidate_symbols = []
+            for _, symbol in ranked:
+                if symbol not in candidate_symbols:
+                    candidate_symbols.append(symbol)
+                if len(candidate_symbols) >= max_candidates:
+                    break
+
+            # BTC and ETH are always analysed because market_context requires
+            # them as reference markets, even if they fall outside the top-N.
+            analysis_symbols = list(candidate_symbols)
+            for reference_symbol in ("BTCUSDT", "ETHUSDT"):
+                if reference_symbol not in tradeable:
+                    raise RuntimeError(reference_symbol + " is not tradeable")
+                if reference_symbol not in analysis_symbols:
+                    analysis_symbols.append(reference_symbol)
+
+            print(
+                prefix + "DISCOVERY universe=" + str(len(tradeable)) +
+                "; ticker_matches=" + str(len(ranked)) +
+                "; candidates=" + str(len(candidate_symbols)) +
+                "; top=" + ",".join(candidate_symbols),
+                flush=True,
+            )
+
             analyses = {}
             candles_by_symbol = {}
             prices = {}
             candle_times = {}
 
             # Fetch/validate all public market data before any DB write.
-            for symbol in symbols:
+            for symbol in analysis_symbols:
                 candles = bitget_market.get_multi_timeframe_candles(
                     symbol=symbol,
                     timeframes=frames,
@@ -2526,7 +2590,10 @@ def run_controlled_market_scanner():
                 prices[symbol] = price
                 candle_times[symbol] = stamp
 
-            if len(set(candle_times.values())) != 1:
+            reference_times = {
+                candle_times.get("BTCUSDT"), candle_times.get("ETHUSDT")
+            }
+            if None in reference_times or len(reference_times) != 1:
                 raise ValueError("BTC and ETH snapshots use different five-minute candles")
 
             observed_at = datetime.fromtimestamp(
@@ -2561,7 +2628,7 @@ def run_controlled_market_scanner():
             opportunities = []
             skipped_existing = 0
 
-            for symbol in symbols:
+            for symbol in candidate_symbols:
                 for direction in ("LONG", "SHORT"):
                     if (symbol, direction) in existing:
                         skipped_existing += 1
