@@ -1809,7 +1809,7 @@ def run_hourly_memory_learning_loop():
                       -- Never feed synthetic diagnostics to Bitget. Step 4.7
                       -- deliberately stores SIGNALS2TESTUSDT, which is not a
                       -- real exchange symbol and must stay outside learning.
-                      AND r.symbol NOT LIKE 'SIGNALS2TEST%'
+                      AND r.symbol NOT LIKE 'SIGNALS2%'
                     ORDER BY r.opportunity_time ASC
                     LIMIT 24
                 """)
