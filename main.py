@@ -2405,6 +2405,300 @@ def run_real_market_ai_diagnostic():
         return False
 
 
+# ============================================================
+# TASK 6: CONTROLLED AUTOMATIC MARKET SCANNER (OPT-IN)
+#
+# Development-only scanner:
+# - Public Bitget market data
+# - BTCUSDT / ETHUSDT only for the first controlled rollout
+# - LONG + SHORT analysis
+# - Uses technical, market context, memory, AI (only when explicitly enabled),
+#   confidence, selector and formatter stages
+# - Stores every considered opportunity for unbiased learning
+# - DOES NOT send Telegram messages
+# - DOES NOT execute trades
+#
+# Enable with:
+# SIGNALS2_CONTROLLED_SCANNER_ON_START=true
+#
+# Optional:
+# SIGNALS2_CONTROLLED_SCANNER_CONTINUOUS=true
+# SIGNALS2_CONTROLLED_SCANNER_INTERVAL_SECONDS=600
+# ============================================================
+
+def run_controlled_market_scanner():
+    prefix = "CONTROLLED SCANNER: "
+    required = (
+        bitget_market, technical_analysis, market_context, memory_engine,
+        pattern_memory, confidence_engine, signal_selector, telegram_formatter,
+    )
+
+    if not DEVELOPMENT_MODE:
+        print(prefix + "BLOCKED (development mode required)", flush=True)
+        return False
+    if LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
+        print(prefix + "BLOCKED (live scanning/Telegram flags must remain disabled)", flush=True)
+        return False
+    if any(module is None for module in required):
+        print(prefix + "BLOCKED (required module unavailable)", flush=True)
+        return False
+
+    continuous = (
+        os.environ.get("SIGNALS2_CONTROLLED_SCANNER_CONTINUOUS", "")
+        .strip().lower() == "true"
+    )
+    try:
+        interval = int(
+            os.environ.get(
+                "SIGNALS2_CONTROLLED_SCANNER_INTERVAL_SECONDS",
+                str(SCAN_INTERVAL_SECONDS),
+            )
+        )
+    except Exception:
+        interval = SCAN_INTERVAL_SECONDS
+    interval = max(300, interval)
+
+    ai_enabled = (
+        os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"
+    )
+    if ai_enabled and ai_analyst is None:
+        print(prefix + "BLOCKED (AI enabled but analyst unavailable)", flush=True)
+        return False
+
+    print(
+        prefix + "START (" +
+        ("continuous; " + str(interval) + "s interval" if continuous else "one cycle") +
+        "; BTCUSDT/ETHUSDT; Telegram OFF; no trades)",
+        flush=True,
+    )
+
+    cycle = 0
+    while True:
+        cycle += 1
+        print(prefix + "CYCLE " + str(cycle) + ": START", flush=True)
+        connection = None
+        try:
+            import math
+            from datetime import timedelta
+
+            # Re-check safety every cycle.
+            if LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
+                raise RuntimeError("Safety flags changed")
+
+            frames = ("5m", "15m", "30m", "1H", "4H", "1D")
+            symbols = ("BTCUSDT", "ETHUSDT")
+            analyses = {}
+            candles_by_symbol = {}
+            prices = {}
+            candle_times = {}
+
+            # Fetch/validate all public market data before any DB write.
+            for symbol in symbols:
+                candles = bitget_market.get_multi_timeframe_candles(
+                    symbol=symbol,
+                    timeframes=frames,
+                    limit=200,
+                )
+                counts = {frame: len(candles.get(frame, [])) for frame in frames}
+                if any(count < 55 for count in counts.values()):
+                    raise ValueError("Insufficient closed candle history: " + symbol)
+
+                analysis = technical_analysis.analyze_symbol(
+                    symbol=symbol,
+                    multi_timeframe_candles=candles,
+                )
+                if not all(
+                    analysis.get("timeframes", {}).get(frame, {}).get("valid")
+                    for frame in frames
+                ):
+                    raise ValueError("Invalid timeframe analysis: " + symbol)
+
+                last_5m = candles["5m"][-1]
+                price = float(last_5m["close"])
+                stamp = int(last_5m["timestamp"])
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError("Invalid price: " + symbol)
+                if stamp <= 0 or stamp % 300000:
+                    raise ValueError("Invalid five-minute candle timestamp: " + symbol)
+
+                analyses[symbol] = analysis
+                candles_by_symbol[symbol] = candles
+                prices[symbol] = price
+                candle_times[symbol] = stamp
+
+            if len(set(candle_times.values())) != 1:
+                raise ValueError("BTC and ETH snapshots use different five-minute candles")
+
+            observed_at = datetime.fromtimestamp(
+                (next(iter(candle_times.values())) + 300000) / 1000,
+                tz=timezone.utc,
+            )
+
+            full_context = market_context.build_market_context(
+                btc_analysis=analyses["BTCUSDT"],
+                eth_analysis=analyses["ETHUSDT"],
+                all_symbol_analyses=list(analyses.values()),
+            )
+
+            connection = memory_engine.connect()
+
+            # Do not duplicate observations already collected by the hourly
+            # memory loop for the same closed five-minute candle.
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT symbol, direction
+                       FROM signals2_opportunities
+                       WHERE symbol IN ('BTCUSDT', 'ETHUSDT')
+                         AND created_at >= %s
+                         AND created_at < %s""",
+                    (observed_at, observed_at + timedelta(minutes=5)),
+                )
+                existing = {
+                    (str(row[0]), str(row[1]))
+                    for row in cursor.fetchall()
+                }
+
+            opportunities = []
+            skipped_existing = 0
+
+            for symbol in symbols:
+                for direction in ("LONG", "SHORT"):
+                    if (symbol, direction) in existing:
+                        skipped_existing += 1
+                        continue
+
+                    coin_context = market_context.build_coin_market_context(
+                        coin_analysis=analyses[symbol],
+                        btc_analysis=analyses["BTCUSDT"],
+                        market_context=full_context,
+                        direction=direction,
+                    )
+
+                    opportunity = analyse_opportunity(
+                        symbol=symbol,
+                        direction=direction,
+                        current_price=prices[symbol],
+                        multi_timeframe_candles=candles_by_symbol[symbol],
+                        full_market_context=coin_context,
+                        database_connection=connection,
+                        observed_at=observed_at,
+                    )
+
+                    confidence = opportunity.get("confidence_result") or {}
+                    score = float(confidence.get("final_confidence"))
+                    if not math.isfinite(score) or not 0 <= score <= 100:
+                        raise ValueError("Invalid confidence score")
+                    if confidence.get("eligible") and (
+                        score < MINIMUM_SIGNAL_CONFIDENCE
+                        or (confidence.get("evidence_gates") or {}).get("passed") is not True
+                    ):
+                        raise ValueError("Confidence eligibility gate violation")
+
+                    opportunities.append(opportunity)
+                    print(
+                        prefix + symbol + " " + direction +
+                        "; confidence=" + str(round(score, 2)) +
+                        "; memory_usable=" +
+                        str(bool((opportunity.get("memory_analysis") or {}).get("memory_usable"))) +
+                        "; ai_available=" +
+                        str(bool((opportunity.get("ai_result") or {}).get("available"))),
+                        flush=True,
+                    )
+
+            if not opportunities:
+                print(
+                    prefix + "CYCLE " + str(cycle) +
+                    ": SKIPPED (this closed candle already stored)",
+                    flush=True,
+                )
+            else:
+                batch = process_analysis_batch(
+                    opportunities,
+                    recent_signal_times={},
+                )
+                selection = batch.get("selection") or {}
+                selected = selection.get("selected") or []
+                formatted = batch.get("formatted_signals") or []
+
+                # The controlled scanner may FORMAT an approved candidate,
+                # but sending is forbidden in this stage.
+                if TELEGRAM_SENDING_ENABLED:
+                    raise RuntimeError("Telegram sending unexpectedly enabled")
+
+                stored = store_analysis_batch(
+                    batch,
+                    database_connection=connection,
+                )
+                if not stored.get("stored") or stored.get("count") != len(opportunities):
+                    raise RuntimeError("Scanner memory storage incomplete")
+
+                for candidate in selected:
+                    confidence = candidate.get("confidence_result") or {}
+                    if (
+                        float(confidence.get("final_confidence", 0)) < MINIMUM_SIGNAL_CONFIDENCE
+                        or confidence.get("eligible") is not True
+                        or (confidence.get("evidence_gates") or {}).get("passed") is not True
+                    ):
+                        raise RuntimeError("Selected candidate violated approval gates")
+
+                print(
+                    prefix + "CYCLE " + str(cycle) +
+                    ": PASS (analysed=" + str(len(opportunities)) +
+                    "; existing_skipped=" + str(skipped_existing) +
+                    "; selected=" + str(len(selected)) +
+                    "; formatted=" + str(len(formatted)) +
+                    "; stored=" + str(stored.get("count")) +
+                    "; sent=0; trades=0)",
+                    flush=True,
+                )
+
+            if connection is not None:
+                connection.close()
+                connection = None
+
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                connection = None
+
+            detail = str(exc).replace("\n", " ").replace("\r", " ")[:400]
+            for secret_name in (
+                "SIGNALS2_DATABASE_URL", "DATABASE_URL",
+                "BITGET_API_KEY", "BITGET_SECRET_KEY",
+                "BITGET_PASSPHRASE", "OPENAI_API_KEY",
+                "SIGNALS2_TELEGRAM_BOT_TOKEN",
+            ):
+                secret_value = os.environ.get(secret_name)
+                if secret_value:
+                    detail = detail.replace(secret_value, "[REDACTED]")
+
+            print(
+                prefix + "CYCLE " + str(cycle) + ": FAIL (" +
+                type(exc).__name__ + "): " + detail,
+                flush=True,
+            )
+
+        if not continuous:
+            print(
+                prefix + "STOPPED (one controlled cycle completed; no sends or trades)",
+                flush=True,
+            )
+            return True
+
+        print(
+            prefix + "WAIT (" + str(interval) + " seconds until next cycle)",
+            flush=True,
+        )
+        time.sleep(interval)
+
+
 if __name__ == "__main__":
 
     try:
@@ -2434,6 +2728,9 @@ if __name__ == "__main__":
 
         if os.environ.get("SIGNALS2_AUTO_OBSERVATION_TEST_ON_START", "").lower().strip() == "true":
             run_automatic_observation_collector()
+
+        if os.environ.get("SIGNALS2_CONTROLLED_SCANNER_ON_START", "").lower().strip() == "true":
+            run_controlled_market_scanner()
 
         if os.environ.get("SIGNALS2_HOURLY_MEMORY_LOOP_ON_START", "").lower().strip() == "true":
             run_hourly_memory_learning_loop()
