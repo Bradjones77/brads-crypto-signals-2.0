@@ -2467,7 +2467,7 @@ def run_controlled_market_scanner():
 
     print(
         prefix + "START (" +
-        ("continuous; " + str(interval) + "s interval" if continuous else "one cycle") +
+        ("continuous; aligned 5m close + 30s" if continuous else "one cycle") +
         "; dynamic Bitget USDT futures; Telegram OFF; no trades)",
         flush=True,
     )
@@ -2499,7 +2499,7 @@ def run_controlled_market_scanner():
             # contain non-standard/tokenized markets alongside ordinary crypto
             # perpetuals. Exclude known unwanted markets and allow the list to
             # be extended from Railway without changing code.
-            default_excluded = {"SOXLUSDT", "SNDKUSDT"}
+            default_excluded = {"SOXLUSDT", "SNDKUSDT", "XAUUSDT"}
             configured_excluded = {
                 item.strip().upper()
                 for item in os.environ.get(
@@ -2615,8 +2615,27 @@ def run_controlled_market_scanner():
             if None in reference_times or len(reference_times) != 1:
                 raise ValueError("BTC and ETH snapshots use different five-minute candles")
 
+            # BTC/ETH define the canonical closed 5m snapshot. Candidates that
+            # have not reached the same closed candle are skipped rather than
+            # mixing market states from different times.
+            reference_stamp = candle_times["BTCUSDT"]
+            mismatched_symbols = [
+                symbol for symbol in candidate_symbols
+                if candle_times.get(symbol) != reference_stamp
+            ]
+            if mismatched_symbols:
+                print(
+                    prefix + "SNAPSHOT SKIP mismatched=" +
+                    ",".join(mismatched_symbols),
+                    flush=True,
+                )
+                candidate_symbols = [
+                    symbol for symbol in candidate_symbols
+                    if candle_times.get(symbol) == reference_stamp
+                ]
+
             observed_at = datetime.fromtimestamp(
-                (next(iter(candle_times.values())) + 300000) / 1000,
+                (reference_stamp + 300000) / 1000,
                 tz=timezone.utc,
             )
 
@@ -2628,21 +2647,28 @@ def run_controlled_market_scanner():
 
             connection = memory_engine.connect()
 
-            # Do not duplicate observations already collected by the hourly
-            # memory loop for the same closed five-minute candle.
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """SELECT symbol, direction
-                       FROM signals2_opportunities
-                       WHERE symbol IN ('BTCUSDT', 'ETHUSDT')
-                         AND created_at >= %s
-                         AND created_at < %s""",
-                    (observed_at, observed_at + timedelta(minutes=5)),
+            # Do not duplicate any candidate already stored for this closed
+            # five-minute snapshot. Query placeholders are generated only for
+            # the bounded internal candidate list; symbol values stay parameterized.
+            existing = set()
+            if candidate_symbols:
+                placeholders = ",".join(["%s"] * len(candidate_symbols))
+                query = (
+                    "SELECT symbol, direction "
+                    "FROM signals2_opportunities "
+                    "WHERE symbol IN (" + placeholders + ") "
+                    "AND created_at >= %s AND created_at < %s"
                 )
-                existing = {
-                    (str(row[0]), str(row[1]))
-                    for row in cursor.fetchall()
-                }
+                params = tuple(candidate_symbols) + (
+                    observed_at,
+                    observed_at + timedelta(minutes=5),
+                )
+                with connection.cursor() as cursor:
+                    cursor.execute(query, params)
+                    existing = {
+                        (str(row[0]), str(row[1]))
+                        for row in cursor.fetchall()
+                    }
 
             opportunities = []
             skipped_existing = 0
@@ -2778,11 +2804,18 @@ def run_controlled_market_scanner():
             )
             return True
 
+        # Continuous development scanning is aligned to the next closed
+        # five-minute candle plus a 30-second settlement buffer. This avoids
+        # drifting away from candle boundaries after each scan.
+        now_ts = time.time()
+        next_boundary = ((int(now_ts) // 300) + 1) * 300 + 30
+        wait_seconds = max(1, int(next_boundary - now_ts))
         print(
-            prefix + "WAIT (" + str(interval) + " seconds until next cycle)",
+            prefix + "WAIT (" + str(wait_seconds) +
+            " seconds until next 5m boundary + 30s)",
             flush=True,
         )
-        time.sleep(interval)
+        time.sleep(wait_seconds)
 
 
 if __name__ == "__main__":
