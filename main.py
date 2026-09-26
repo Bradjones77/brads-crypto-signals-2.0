@@ -1806,6 +1806,10 @@ def run_hourly_memory_learning_loop():
                     FROM signals2_outcomes r
                     WHERE r.outcome_complete = FALSE
                       AND r.opportunity_time <= (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours 5 minutes'
+                      -- Never feed synthetic diagnostics to Bitget. Step 4.7
+                      -- deliberately stores SIGNALS2TESTUSDT, which is not a
+                      -- real exchange symbol and must stay outside learning.
+                      AND r.symbol NOT LIKE 'SIGNALS2TEST%'
                     ORDER BY r.opportunity_time ASC
                     LIMIT 24
                 """)
