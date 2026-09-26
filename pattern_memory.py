@@ -220,15 +220,27 @@ FEATURE_WEIGHTS = {
 
     "eth_alignment": 1.2,
 
+    # Broad market direction/alignment.
+    "market_alignment": 1.6,
+
+    "market_average_alignment": 1.3,
+
     "market_bullish_pct": 1.2,
 
     "market_bearish_pct": 1.2,
 
+    # Broad volatility/stress conditions.
+    "market_average_atr_pct": 1.0,
+
     "market_stress_score": 1.4,
 
-    "direction_market_agreement": 1.8,
+    # These names intentionally match build_context_features()
+    # in market_context.py.  The previous aliases did not match
+    # the stored flattened feature names, so they were silently
+    # excluded from pattern similarity.
+    "market_agreement": 1.8,
 
-    "relative_strength_vs_btc": 1.4,
+    "relative_strength_btc": 1.4,
 }
 
 
