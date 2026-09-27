@@ -63,7 +63,7 @@ DATABASE_CONNECTION_ENABLED = False
 # ============================================================
 
 
-MINIMUM_SIGNAL_CONFIDENCE = 75.0
+MINIMUM_SIGNAL_CONFIDENCE = 80.0
 
 
 # ============================================================
@@ -1185,12 +1185,12 @@ def print_startup_status():
     )
 
     print(
-        "0-74.99: DO NOT SEND",
+        "0-79.99: DO NOT SEND",
         flush=True,
     )
 
     print(
-        "75-100: ELIGIBLE",
+        "80-100: ELIGIBLE",
         flush=True,
     )
 
@@ -1359,7 +1359,7 @@ def run_read_only_integration_diagnostic():
                 confidence = opportunity.get("confidence_result", {})
                 if not isinstance(confidence, dict) or confidence.get("component_scores", {}).get("technical") is None:
                     raise ValueError(symbol + " " + direction + " confidence stage failed")
-                if confidence.get("eligible") and (float(confidence.get("final_confidence", 0)) < 75
+                if confidence.get("eligible") and (float(confidence.get("final_confidence", 0)) < MINIMUM_SIGNAL_CONFIDENCE
                                                   or confidence.get("evidence_gates", {}).get("passed") is not True):
                     raise ValueError("Confidence safety gate violation")
                 opportunities.append(opportunity)
@@ -1378,7 +1378,7 @@ def run_read_only_integration_diagnostic():
             raise ValueError("Formatter output count exceeds selected count")
         for opportunity in selected:
             conf = opportunity.get("confidence_result", {})
-            if (float(conf.get("final_confidence", 0)) < 75 or
+            if (float(conf.get("final_confidence", 0)) < MINIMUM_SIGNAL_CONFIDENCE or
                     conf.get("eligible") is not True or
                     conf.get("evidence_gates", {}).get("passed") is not True):
                 raise ValueError("Selected signal violates confidence gate")
@@ -3001,7 +3001,7 @@ if __name__ == "__main__":
                             raise ValueError("No market score for " + direction)
                         if result.get("eligible") != confidence_engine.signal_is_eligible(result):
                             raise ValueError("Eligibility mismatch for " + direction)
-                        if result.get("eligible") and result.get("final_confidence", 0) < 75.0:
+                        if result.get("eligible") and result.get("final_confidence", 0) < MINIMUM_SIGNAL_CONFIDENCE:
                             raise ValueError("Threshold violation for " + direction)
                     print("CONFIDENCE DIAGNOSTIC: PASS (calculation only; no signal sent)", flush=True)
                 except Exception as exc:
@@ -3017,7 +3017,7 @@ if __name__ == "__main__":
                     from datetime import timedelta
                     now = utc_now()
 
-                    def sample(symbol="BTCUSDT", direction="LONG", score=75.0,
+                    def sample(symbol="BTCUSDT", direction="LONG", score=80.0,
                                eligible=True, decision="ELIGIBLE", gate_passed=True,
                                observed_at=None):
                         return {
@@ -3039,8 +3039,8 @@ if __name__ == "__main__":
                               ("PASS" if condition else "FAIL"), flush=True)
 
                     evaluate = signal_selector.evaluate_opportunity
-                    check("below 75 rejected", not evaluate(sample(score=74.99), now=now)["selected"])
-                    check("exactly 75 eligible", evaluate(sample(score=75.0), now=now)["selected"])
+                    check("below 80 rejected", not evaluate(sample(score=79.99), now=now)["selected"])
+                    check("exactly 80 eligible", evaluate(sample(score=80.0), now=now)["selected"])
                     check("engine ineligible rejected", not evaluate(sample(eligible=False), now=now)["selected"])
                     check("contradictory decision rejected", not evaluate(sample(decision="REJECTED"), now=now)["selected"])
                     check("failed evidence gate rejected", not evaluate(sample(gate_passed=False), now=now)["selected"])
@@ -3074,7 +3074,7 @@ if __name__ == "__main__":
                 try:
                     now = utc_now()
 
-                    def formatter_sample(score=75.0, selected=True, eligible=True,
+                    def formatter_sample(score=80.0, selected=True, eligible=True,
                                          decision="ELIGIBLE", gate_passed=True):
                         return {
                             "symbol": "BTCUSDT", "direction": "LONG",
@@ -3104,7 +3104,7 @@ if __name__ == "__main__":
                         "TRADE SIGNAL", "LONG", "BTCUSDT", "Confidence:", "Time:", "Entry:")))
                     formatter_check("no TP or SL", all(part not in message for part in (
                         "TP1", "TP2", "TP3", "Stop Loss", "Stop-loss", "SL:")))
-                    formatter_check("below 75 rejected", build(formatter_sample(score=74.99)).get("ready") is False)
+                    formatter_check("below 80 rejected", build(formatter_sample(score=79.99)).get("ready") is False)
                     formatter_check("unselected rejected", build(formatter_sample(selected=False)).get("ready") is False)
                     formatter_check("engine ineligible rejected", build(formatter_sample(eligible=False)).get("ready") is False)
                     formatter_check("rejected decision rejected", build(formatter_sample(decision="REJECTED")).get("ready") is False)
