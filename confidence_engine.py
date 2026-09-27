@@ -22,8 +22,8 @@ from typing import Dict, Any, Optional
 #
 # HARD SIGNAL RULE:
 #
-# 0 - 74.99 = REJECT
-# 75 - 100  = ELIGIBLE
+# 0 - 79.99 = REJECT
+# 80 - 100  = ELIGIBLE
 #
 #
 # IMPORTANT:
@@ -48,7 +48,7 @@ from typing import Dict, Any, Optional
 
 CONFIDENCE_ENGINE_VERSION = "signals2-confidence-v1.2"
 
-SIGNAL_THRESHOLD = 75.0
+SIGNAL_THRESHOLD = 80.0
 
 
 # ============================================================
@@ -2079,7 +2079,7 @@ def calculate_final_confidence(
         gates["passed"] = False
 
     # --------------------------------------------------------
-    # HARD 75 CONFIDENCE RULE
+    # HARD 80 CONFIDENCE RULE
     # --------------------------------------------------------
 
     confidence_passed = (
@@ -2459,12 +2459,12 @@ if __name__ == "__main__":
     )
 
     print(
-        "0-74.99: REJECTED",
+        "0-79.99: REJECTED",
         flush=True,
     )
 
     print(
-        "75-100: ELIGIBLE",
+        "80-100: ELIGIBLE",
         flush=True,
     )
 
