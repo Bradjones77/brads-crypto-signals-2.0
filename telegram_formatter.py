@@ -45,7 +45,7 @@ from typing import Dict, Any, Optional
 
 TELEGRAM_FORMATTER_VERSION = "signals2-telegram-formatter-v2-approval-gates"
 
-MIN_CONFIDENCE = 75.0
+MIN_CONFIDENCE = 80.0
 
 
 # ============================================================
@@ -446,10 +446,10 @@ def extract_signal_time(
 # ============================================================
 # VALIDATE SIGNAL BEFORE FORMATTING
 #
-# This repeats the 75 confidence protection.
+# This repeats the 80 confidence protection.
 #
 # Even though signal_selector.py already checks it,
-# the Telegram layer will not format a sub-75 signal.
+# the Telegram layer will not format a sub-80 signal.
 # ============================================================
 
 
