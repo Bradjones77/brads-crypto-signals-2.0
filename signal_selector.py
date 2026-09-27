@@ -23,8 +23,8 @@ from typing import Dict, Any, List, Optional
 #
 # HARD RULE:
 #
-# 0 - 74.99 = NEVER SEND
-# 75 - 100  = ELIGIBLE
+# 0 - 79.99 = NEVER SEND
+# 80 - 100  = ELIGIBLE
 #
 #
 # IMPORTANT:
@@ -44,7 +44,7 @@ from typing import Dict, Any, List, Optional
 
 SIGNAL_SELECTOR_VERSION = "signals2-selector-v1.1"
 
-MIN_CONFIDENCE = 75.0
+MIN_CONFIDENCE = 80.0
 
 
 # ============================================================
@@ -388,7 +388,7 @@ def validate_opportunity(
 # ============================================================
 # CONFIDENCE GATE
 #
-# This deliberately repeats the hard 75 threshold.
+# This deliberately repeats the hard 80 threshold.
 #
 # Even if another module accidentally marks a 74 signal as
 # eligible, this selector will reject it.
@@ -788,7 +788,7 @@ def passes_cooldown_gate(
 #
 # This does NOT replace final confidence.
 #
-# Every selected signal must already be >= 75.
+# Every selected signal must already be >= 80.
 #
 # Ranking is only used when several eligible opportunities
 # exist at the same time.
@@ -849,7 +849,7 @@ def calculate_selection_score(
     # Confidence remains dominant.
     #
     # Quality and agreement only help order opportunities
-    # that have already passed 75.
+    # that have already passed 80.
 
     selection_score = (
 
@@ -1440,7 +1440,7 @@ def select_signals(
 # This allows us to store WHY an opportunity was:
 #
 # - selected
-# - rejected below 75
+# - rejected below 80
 # - stale
 # - cooldown blocked
 # - duplicate
@@ -1561,12 +1561,12 @@ if __name__ == "__main__":
     )
 
     print(
-        "0-74.99: NEVER SELECTED",
+        "0-79.99: NEVER SELECTED",
         flush=True,
     )
 
     print(
-        "75-100: ELIGIBLE FOR SELECTION",
+        "80-100: ELIGIBLE FOR SELECTION",
         flush=True,
     )
 
