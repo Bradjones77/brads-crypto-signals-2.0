@@ -2499,7 +2499,15 @@ def run_controlled_market_scanner():
             # contain non-standard/tokenized markets alongside ordinary crypto
             # perpetuals. Exclude known unwanted markets and allow the list to
             # be extended from Railway without changing code.
-            default_excluded = {"SOXLUSDT", "SNDKUSDT", "XAUUSDT"}
+            default_excluded = {
+                # Non-crypto / tokenized markets observed in Bitget's futures
+                # universe during controlled Railway scans. Keep this fail-closed
+                # list extensible through SIGNALS2_SCANNER_EXCLUDED_SYMBOLS.
+                "SOXLUSDT",
+                "SNDKUSDT",
+                "XAUUSDT",
+                "MSTRUSDT",
+            }
             configured_excluded = {
                 item.strip().upper()
                 for item in os.environ.get(
@@ -2509,6 +2517,11 @@ def run_controlled_market_scanner():
             }
             excluded_symbols = default_excluded | configured_excluded
 
+            # Important: the current Bitget contract data exposed to this bot
+            # does not provide a field we have verified as a complete
+            # crypto-vs-tokenized-asset classifier. Therefore this scanner
+            # fails closed on known non-crypto symbols instead of guessing
+            # from ticker names.
             ranked = []
             excluded_count = 0
             for ticker in tickers:
