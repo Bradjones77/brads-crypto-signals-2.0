@@ -1,4 +1,5 @@
 import time
+import threading
 import os
 import json
 import urllib.request
@@ -2861,11 +2862,38 @@ if __name__ == "__main__":
         if os.environ.get("SIGNALS2_AUTO_OBSERVATION_TEST_ON_START", "").lower().strip() == "true":
             run_automatic_observation_collector()
 
-        if os.environ.get("SIGNALS2_CONTROLLED_SCANNER_ON_START", "").lower().strip() == "true":
+        scanner_on_start = (
+            os.environ.get("SIGNALS2_CONTROLLED_SCANNER_ON_START", "").lower().strip() == "true"
+        )
+        scanner_continuous = (
+            os.environ.get("SIGNALS2_CONTROLLED_SCANNER_CONTINUOUS", "").lower().strip() == "true"
+        )
+        hourly_memory_on_start = (
+            os.environ.get("SIGNALS2_HOURLY_MEMORY_LOOP_ON_START", "").lower().strip() == "true"
+        )
+
+        # In continuous development scanning, keep the hourly learning loop alive
+        # in a separate daemon thread. The scanner remains on the main thread so
+        # an unexpected scanner failure still fails visibly instead of being hidden.
+        if scanner_on_start and scanner_continuous and hourly_memory_on_start:
+            print(
+                "CONTROLLER: STARTING HOURLY MEMORY WORKER "
+                "(parallel with continuous controlled scanner)"
+            )
+            memory_thread = threading.Thread(
+                target=run_hourly_memory_learning_loop,
+                name="signals2-hourly-memory",
+                daemon=True,
+            )
+            memory_thread.start()
             run_controlled_market_scanner()
 
-        if os.environ.get("SIGNALS2_HOURLY_MEMORY_LOOP_ON_START", "").lower().strip() == "true":
-            run_hourly_memory_learning_loop()
+        else:
+            if scanner_on_start:
+                run_controlled_market_scanner()
+
+            if hourly_memory_on_start:
+                run_hourly_memory_learning_loop()
 
         if os.environ.get("SIGNALS2_MARKET_MEMORY_TEST_ON_START", "").lower().strip() == "true":
             run_market_memory_diagnostic()
