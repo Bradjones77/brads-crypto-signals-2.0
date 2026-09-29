@@ -1273,6 +1273,21 @@ def print_startup_status():
         flush=True,
     )
 
+    _telegram_runtime_raw = os.environ.get(
+        "SIGNALS2_TELEGRAM_SENDING_ENABLED",
+        "",
+    )
+    print(
+        "TELEGRAM RUNTIME ENV DETECTED:",
+        bool(_telegram_runtime_raw),
+        flush=True,
+    )
+    print(
+        "TELEGRAM RUNTIME ENABLED:",
+        runtime_telegram_sending_enabled(),
+        flush=True,
+    )
+
     print(
         "MODULES LOADED:",
         f"{status['modules_loaded']}/"
