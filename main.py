@@ -2598,7 +2598,9 @@ def run_controlled_market_scanner():
     print(
         prefix + "START (" +
         ("continuous; aligned 5m close + 30s" if continuous else "one cycle") +
-        "; dynamic Bitget USDT futures; Telegram OFF; no trades)",
+        "; dynamic Bitget USDT futures; Telegram " +
+        ("ON" if runtime_telegram_sending_enabled() else "OFF") +
+        "; no trades)",
         flush=True,
     )
 
