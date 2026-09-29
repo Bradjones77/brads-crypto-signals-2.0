@@ -175,6 +175,15 @@ except Exception:
 
 try:
 
+    import telegram_sender
+
+except Exception:
+
+    telegram_sender = None
+
+
+try:
+
     import bitget_market
 
 except Exception:
@@ -191,6 +200,17 @@ def utc_now():
 
     return datetime.now(
         timezone.utc
+    )
+
+
+def runtime_telegram_sending_enabled():
+
+    return (
+        DEVELOPMENT_MODE
+        and os.environ.get(
+            "SIGNALS2_TELEGRAM_SENDING_ENABLED",
+            "",
+        ).strip().lower() == "true"
     )
 
 
@@ -887,7 +907,7 @@ def process_analysis_batch(
 # opportunity:
 #
 # - signals we send
-# - signals below 75
+# - signals below 80
 # - signals rejected by evidence gates
 # - duplicate/cooldown opportunities
 #
@@ -994,32 +1014,126 @@ def store_analysis_batch(
 
 
 def send_formatted_signals(
-    formatted_signals: List[
-        Dict[str, Any]
-    ],
+    formatted_signals: List[Dict[str, Any]],
+    selected_opportunities: Optional[List[Dict[str, Any]]] = None,
+    opportunity_ids: Optional[List[str]] = None,
+    database_connection=None,
 ):
 
-    if not TELEGRAM_SENDING_ENABLED:
-
+    if not runtime_telegram_sending_enabled():
         return {
-
-            "sent":
-            0,
-
-            "reason":
-            "Telegram sending intentionally disabled.",
+            "sent": 0,
+            "attempted": 0,
+            "reason": "Runtime Telegram sending disabled.",
         }
 
-    # Telegram connection will be added during final
-    # integration.
+    if not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
+        raise RuntimeError("Telegram runtime safety flags invalid")
+
+    if telegram_sender is None or telegram_formatter is None:
+        raise RuntimeError("Telegram sender or formatter unavailable")
+
+    if database_connection is None:
+        raise RuntimeError("Explicit database connection required for Telegram sending")
+
+    if not isinstance(formatted_signals, list):
+        raise ValueError("Invalid formatted signal list")
+    if not isinstance(selected_opportunities, list):
+        raise ValueError("Selected opportunities required")
+    if not isinstance(opportunity_ids, list):
+        raise ValueError("Opportunity IDs required")
+    if len(formatted_signals) != len(selected_opportunities):
+        raise ValueError("Formatted/selected signal count mismatch")
+
+    id_by_object = {
+        id(opportunity): record_id
+        for opportunity, record_id in zip(
+            selected_opportunities,
+            opportunity_ids,
+        )
+    }
+
+    sent = 0
+    attempted = 0
+
+    for record, opportunity in zip(
+        formatted_signals,
+        selected_opportunities,
+    ):
+        if not isinstance(record, dict) or record.get("ready") is not True:
+            raise RuntimeError("Formatter produced a non-ready selected signal")
+
+        confidence = opportunity.get("confidence_result") or {}
+        score = float(confidence.get("final_confidence", 0))
+        if (
+            score < MINIMUM_SIGNAL_CONFIDENCE
+            or confidence.get("eligible") is not True
+            or confidence.get("decision") != "ELIGIBLE"
+            or (confidence.get("evidence_gates") or {}).get("passed") is not True
+            or opportunity.get("selector_status") != "SELECTED"
+        ):
+            raise RuntimeError("Telegram candidate violated approval gates")
+
+        record_id = id_by_object.get(id(opportunity))
+        if not record_id:
+            raise RuntimeError("Missing durable opportunity ID for Telegram signal")
+
+        # Durable duplicate protection: only SELECTED_NOT_SENT + signal_sent=FALSE
+        # may proceed. The row was stored before this function is called.
+        with database_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT signal_sent, decision
+                FROM signals2_opportunities
+                WHERE opportunity_id = %s
+                FOR UPDATE
+                """,
+                (record_id,),
+            )
+            row = cursor.fetchone()
+
+        if row is None:
+            raise RuntimeError("Telegram opportunity row missing")
+
+        already_sent = bool(row[0])
+        decision = str(row[1] or "")
+        if already_sent or decision == "SENT":
+            continue
+        if decision != "SELECTED_NOT_SENT":
+            raise RuntimeError("Telegram opportunity is not in sendable state")
+
+        attempted += 1
+        result = telegram_sender.send_signal_record(record)
+
+        if result.get("sent") is not True:
+            # Fail closed. Do not mark sent and do not silently retry here.
+            raise RuntimeError(
+                "Telegram delivery failed: " +
+                str(result.get("reason") or "unknown")
+            )
+
+        # Only confirmed Telegram success changes the durable sent state.
+        with database_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE signals2_opportunities
+                SET signal_sent = TRUE,
+                    decision = 'SENT'
+                WHERE opportunity_id = %s
+                  AND signal_sent = FALSE
+                  AND decision = 'SELECTED_NOT_SENT'
+                """,
+                (record_id,),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Telegram sent-state update failed")
+        database_connection.commit()
+        sent += 1
 
     return {
-
-        "sent":
-        0,
-
-        "reason":
-        "Telegram integration not configured yet.",
+        "sent": sent,
+        "attempted": attempted,
+        "reason": "Telegram runtime delivery completed.",
     }
 
 
@@ -2746,11 +2860,6 @@ def run_controlled_market_scanner():
                 selected = selection.get("selected") or []
                 formatted = batch.get("formatted_signals") or []
 
-                # The controlled scanner may FORMAT an approved candidate,
-                # but sending is forbidden in this stage.
-                if TELEGRAM_SENDING_ENABLED:
-                    raise RuntimeError("Telegram sending unexpectedly enabled")
-
                 stored = store_analysis_batch(
                     batch,
                     database_connection=connection,
@@ -2763,9 +2872,40 @@ def run_controlled_market_scanner():
                     if (
                         float(confidence.get("final_confidence", 0)) < MINIMUM_SIGNAL_CONFIDENCE
                         or confidence.get("eligible") is not True
+                        or confidence.get("decision") != "ELIGIBLE"
                         or (confidence.get("evidence_gates") or {}).get("passed") is not True
+                        or candidate.get("selector_status") != "SELECTED"
                     ):
                         raise RuntimeError("Selected candidate violated approval gates")
+
+                # store_analysis_batch returns IDs in the same order as the complete
+                # opportunities list. Map only selected objects to their durable IDs.
+                opportunity_id_by_object = {
+                    id(opportunity): record_id
+                    for opportunity, record_id in zip(
+                        opportunities,
+                        stored.get("opportunity_ids") or [],
+                    )
+                }
+                selected_record_ids = [
+                    opportunity_id_by_object.get(id(candidate))
+                    for candidate in selected
+                ]
+                if selected and any(not record_id for record_id in selected_record_ids):
+                    raise RuntimeError("Selected opportunity ID mapping failed")
+
+                telegram_result = {
+                    "sent": 0,
+                    "attempted": 0,
+                    "reason": "Runtime Telegram sending disabled.",
+                }
+                if runtime_telegram_sending_enabled() and selected:
+                    telegram_result = send_formatted_signals(
+                        formatted_signals=formatted,
+                        selected_opportunities=selected,
+                        opportunity_ids=selected_record_ids,
+                        database_connection=connection,
+                    )
 
                 print(
                     prefix + "CYCLE " + str(cycle) +
@@ -2774,7 +2914,8 @@ def run_controlled_market_scanner():
                     "; selected=" + str(len(selected)) +
                     "; formatted=" + str(len(formatted)) +
                     "; stored=" + str(stored.get("count")) +
-                    "; sent=0; trades=0)",
+                    "; sent=" + str(telegram_result.get("sent", 0)) +
+                    "; trades=0)",
                     flush=True,
                 )
 
@@ -3099,7 +3240,7 @@ if __name__ == "__main__":
                     build = telegram_formatter.build_signal_message_record
                     good = build(formatter_sample())
                     message = good.get("message") or ""
-                    formatter_check("approved 75 ready", good.get("ready") is True)
+                    formatter_check("approved 80 ready", good.get("ready") is True)
                     formatter_check("basic message fields", all(part in message for part in (
                         "TRADE SIGNAL", "LONG", "BTCUSDT", "Confidence:", "Time:", "Entry:")))
                     formatter_check("no TP or SL", all(part not in message for part in (
