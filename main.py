@@ -755,6 +755,7 @@ def analyse_opportunity(
     full_market_context: Dict[str, Any],
     database_connection=None,
     observed_at=None,
+    use_ai: bool = True,
 ) -> Dict[str, Any]:
 
     opportunity = (
@@ -787,11 +788,18 @@ def analyse_opportunity(
         )
     )
 
-    opportunity = (
-        run_ai_stage(
-            opportunity
+    if use_ai:
+        opportunity = (
+            run_ai_stage(
+                opportunity
+            )
         )
-    )
+    else:
+        opportunity["ai_result"] = {
+            "available": False,
+            "ai_score": None,
+            "reasoning_summary": "AI intentionally disabled for memory observation.",
+        }
 
     opportunity = (
         run_confidence_stage(
@@ -1732,10 +1740,6 @@ def run_one_off_observation_collection():
             or any(module is None for module in required)):
         print(prefix + "FAIL (safety flags or module unavailable)", flush=True)
         return False
-    # Avoid surprise paid AI requests in this initial memory-connection test.
-    if os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true":
-        print(prefix + "SKIPPED (set SIGNALS2_AI_ENABLED=false for this test)", flush=True)
-        return False
     conn = None
     lock_acquired = False
     try:
@@ -1799,7 +1803,7 @@ def run_one_off_observation_collection():
                     symbol=symbol, direction=direction, current_price=prices[symbol],
                     multi_timeframe_candles=candles_by_symbol[symbol],
                     full_market_context=coin_context, database_connection=conn,
-                    observed_at=observed_at)
+                    observed_at=observed_at, use_ai=False)
                 confidence = opportunity.get("confidence_result") or {}
                 score = float(confidence.get("final_confidence"))
                 if not math.isfinite(score) or not 0 <= score <= 100:
@@ -1865,9 +1869,8 @@ def run_one_off_observation_collection():
 def run_automatic_observation_collector():
     import time
     prefix = "AUTO OBSERVATION: "
-    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
-            or os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"):
-        print(prefix + "BLOCKED (safety settings; AI must be disabled)", flush=True)
+    if not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
+        print(prefix + "BLOCKED (safety settings)", flush=True)
         return False
     continuous = os.environ.get("SIGNALS2_AUTO_OBSERVATION_CONTINUOUS", "").strip().lower() == "true"
     # Never start an unbounded loop by simply enabling the test switch.
@@ -1884,8 +1887,7 @@ def run_automatic_observation_collector():
         print(prefix + "WAIT (" + str(int(wait)) + " seconds until next closed candle)", flush=True)
         time.sleep(wait)
         # Recheck safety before every cycle, including after a long wait.
-        if (LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED or
-                os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"):
+        if LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
             print(prefix + "STOPPED (safety settings changed)", flush=True)
             return False
         cycles += 1
@@ -2885,13 +2887,28 @@ def run_controlled_market_scanner():
                         raise ValueError("Confidence eligibility gate violation")
 
                     opportunities.append(opportunity)
+                    ai_result = opportunity.get("ai_result") or {}
+                    ai_available = bool(ai_result.get("available"))
+                    ai_reason = ""
+                    if opportunity.get("pre_ai_confidence") is not None and not ai_available:
+                        raw_reason = (
+                            ai_result.get("reasoning_summary")
+                            or ai_result.get("reason")
+                            or ai_result.get("error_type")
+                            or "unavailable"
+                        )
+                        ai_reason = (
+                            "; ai_reason=" +
+                            str(raw_reason).replace("\n", " ").replace("\r", " ")[:160]
+                        )
+
                     print(
                         prefix + symbol + " " + direction +
                         "; confidence=" + str(round(score, 2)) +
                         "; memory_usable=" +
                         str(bool((opportunity.get("memory_analysis") or {}).get("memory_usable"))) +
-                        "; ai_available=" +
-                        str(bool((opportunity.get("ai_result") or {}).get("available"))),
+                        "; ai_available=" + str(ai_available) +
+                        ai_reason,
                         flush=True,
                     )
 
