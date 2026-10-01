@@ -544,6 +544,20 @@ def run_memory_stage(
 
 
 # ============================================================
+# CONTROLLED AI SCAN BUDGET
+#
+# Normal scanning uses cheap technical/market/memory evidence first.
+# Only promising opportunities are sent to AI, with a strict
+# per-scan request cap. This does not change the final 80/100 gate.
+# ============================================================
+
+AI_PRE_SCREEN_THRESHOLD = 65.0
+AI_MAX_CALLS_PER_SCAN = 3
+_ai_scan_budget_active = False
+_ai_scan_calls_remaining = 0
+
+
+# ============================================================
 # AI STAGE
 #
 # File 8 deliberately returns unavailable until we connect
@@ -555,69 +569,84 @@ def run_ai_stage(
     opportunity: Dict[str, Any],
 ) -> Dict[str, Any]:
 
+    global _ai_scan_calls_remaining
+
+    unavailable = {
+        "available": False,
+        "ai_score": None,
+    }
+
     if ai_analyst is None:
-
-        opportunity[
-            "ai_result"
-        ] = {
-
-            "available":
-            False,
-
-            "ai_score":
-            None,
-        }
-
+        opportunity["ai_result"] = dict(unavailable)
         return opportunity
 
-    try:
+    # AI remains opt-in.
+    ai_enabled = (
+        os.environ.get("SIGNALS2_AI_ENABLED", "")
+        .strip().lower() == "true"
+    )
+    if not ai_enabled:
+        opportunity["ai_result"] = dict(unavailable)
+        return opportunity
 
-        result = (
-            ai_analyst.analyze_with_ai(
-                symbol=opportunity[
-                    "symbol"
-                ],
-                direction=opportunity[
-                    "direction"
-                ],
-                current_price=opportunity[
-                    "current_price"
-                ],
-                technical_analysis=opportunity.get(
-                    "technical_analysis",
-                    {},
-                ),
-                market_context=opportunity.get(
-                    "market_context",
-                    {},
-                ),
-                memory_analysis=opportunity.get(
-                    "memory_analysis",
-                    {},
-                ),
+    # During the continuous scanner, pre-screen with the existing
+    # confidence engine while AI is unavailable. This prevents weak
+    # opportunities from consuming OpenAI requests.
+    if _ai_scan_budget_active:
+        if confidence_engine is None:
+            opportunity["ai_result"] = dict(unavailable)
+            opportunity["ai_result"]["reason"] = "Confidence engine unavailable"
+            return opportunity
+
+        try:
+            preliminary = confidence_engine.calculate_final_confidence(
+                symbol=opportunity["symbol"],
+                direction=opportunity["direction"],
+                technical_analysis=opportunity.get("technical_analysis", {}),
+                market_context=opportunity.get("market_context", {}),
+                memory_analysis=opportunity.get("memory_analysis", {}),
+                ai_result=dict(unavailable),
             )
-        )
+            preliminary_score = float(
+                (preliminary or {}).get("final_confidence", 0.0)
+            )
+        except Exception:
+            opportunity["ai_result"] = dict(unavailable)
+            opportunity["ai_result"]["reason"] = "AI pre-screen failed"
+            return opportunity
 
-        opportunity[
-            "ai_result"
-        ] = result or {}
+        opportunity["pre_ai_confidence"] = round(preliminary_score, 2)
+
+        if preliminary_score < AI_PRE_SCREEN_THRESHOLD:
+            opportunity["ai_result"] = dict(unavailable)
+            opportunity["ai_result"]["reason"] = "Below AI pre-screen threshold"
+            return opportunity
+
+        if _ai_scan_calls_remaining <= 0:
+            opportunity["ai_result"] = dict(unavailable)
+            opportunity["ai_result"]["reason"] = "AI scan budget exhausted"
+            return opportunity
+
+        # Reserve the request slot before the network call so failures
+        # cannot accidentally exceed the per-cycle cap.
+        _ai_scan_calls_remaining -= 1
+
+    try:
+        result = ai_analyst.analyze_with_ai(
+            symbol=opportunity["symbol"],
+            direction=opportunity["direction"],
+            current_price=opportunity["current_price"],
+            technical_analysis=opportunity.get("technical_analysis", {}),
+            market_context=opportunity.get("market_context", {}),
+            memory_analysis=opportunity.get("memory_analysis", {}),
+        )
+        opportunity["ai_result"] = result or dict(unavailable)
 
     except Exception as exc:
-
-        opportunity[
-            "ai_result"
-        ] = {
-
-            "available":
-            False,
-
-            "ai_score":
-            None,
-
-            "error":
-            str(
-                exc
-            ),
+        opportunity["ai_result"] = {
+            "available": False,
+            "ai_score": None,
+            "error_type": type(exc).__name__,
         }
 
     return opportunity
@@ -2818,6 +2847,10 @@ def run_controlled_market_scanner():
             opportunities = []
             skipped_existing = 0
 
+            global _ai_scan_budget_active, _ai_scan_calls_remaining
+            _ai_scan_budget_active = ai_enabled
+            _ai_scan_calls_remaining = AI_MAX_CALLS_PER_SCAN if ai_enabled else 0
+
             for symbol in candidate_symbols:
                 for direction in ("LONG", "SHORT"):
                     if (symbol, direction) in existing:
@@ -2861,6 +2894,19 @@ def run_controlled_market_scanner():
                         str(bool((opportunity.get("ai_result") or {}).get("available"))),
                         flush=True,
                     )
+
+            if ai_enabled:
+                print(
+                    prefix + "AI PRE-SCREEN threshold=" +
+                    str(AI_PRE_SCREEN_THRESHOLD) +
+                    "; max_calls=" + str(AI_MAX_CALLS_PER_SCAN) +
+                    "; request_slots_used=" +
+                    str(AI_MAX_CALLS_PER_SCAN - _ai_scan_calls_remaining),
+                    flush=True,
+                )
+
+            _ai_scan_budget_active = False
+            _ai_scan_calls_remaining = 0
 
             if not opportunities:
                 print(
