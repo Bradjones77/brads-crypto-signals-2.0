@@ -1912,9 +1912,8 @@ def run_automatic_observation_collector():
 def run_hourly_memory_learning_loop():
     import time
     prefix = "HOURLY MEMORY LOOP: "
-    if (not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED
-            or os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"):
-        print(prefix + "BLOCKED (safety settings; AI must be disabled)", flush=True)
+    if not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
+        print(prefix + "BLOCKED (safety settings)", flush=True)
         return False
     if memory_engine is None or outcome_tracker is None:
         print(prefix + "BLOCKED (memory/outcome module unavailable)", flush=True)
@@ -1931,8 +1930,7 @@ def run_hourly_memory_learning_loop():
         print(prefix + "WAIT (" + str(int(wait)) + " seconds until next hourly cycle)", flush=True)
         time.sleep(wait)
 
-        if (LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED or
-                os.environ.get("SIGNALS2_AI_ENABLED", "").strip().lower() == "true"):
+        if LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
             print(prefix + "STOPPED (safety settings changed)", flush=True)
             return False
 
