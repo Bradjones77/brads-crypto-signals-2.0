@@ -48,7 +48,7 @@ from typing import Dict, Any, Optional, List
 # ============================================================
 
 
-AI_ANALYST_VERSION = "2.2.0"
+AI_ANALYST_VERSION = "2.2.1"
 
 # Explicit opt-in required for every API call. No automatic live use.
 AI_ENABLED_FLAG = "SIGNALS2_AI_ENABLED"
@@ -317,6 +317,94 @@ def make_json_safe(
 
 
 # ============================================================
+# AI PAYLOAD COMPACTION
+#
+# Keep derived evidence useful while preventing oversized requests.
+# This never changes trading rules, confidence thresholds or execution.
+# ============================================================
+
+AI_REQUEST_MAX_BYTES = 24000
+AI_REQUEST_TARGET_BYTES = 21000
+
+
+def compact_for_ai(
+    value,
+    max_depth=5,
+    max_dict_items=30,
+    max_list_items=12,
+    max_text_length=500,
+    _depth=0,
+):
+    if _depth >= max_depth:
+        if isinstance(value, (dict, list, tuple)):
+            return "[compacted]"
+        return clean_text(value, max_text_length)
+
+    if value is None or isinstance(value, (bool, int)):
+        return value
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return round(value, 8)
+
+    if isinstance(value, str):
+        return clean_text(value, max_text_length)
+
+    if isinstance(value, dict):
+        result = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_dict_items:
+                break
+            result[str(key)] = compact_for_ai(
+                item,
+                max_depth=max_depth,
+                max_dict_items=max_dict_items,
+                max_list_items=max_list_items,
+                max_text_length=max_text_length,
+                _depth=_depth + 1,
+            )
+        return result
+
+    if isinstance(value, (list, tuple)):
+        return [
+            compact_for_ai(
+                item,
+                max_depth=max_depth,
+                max_dict_items=max_dict_items,
+                max_list_items=max_list_items,
+                max_text_length=max_text_length,
+                _depth=_depth + 1,
+            )
+            for item in value[:max_list_items]
+        ]
+
+    return clean_text(value, max_text_length)
+
+
+def compact_evidence_package(
+    evidence_package: Dict[str, Any],
+) -> Dict[str, Any]:
+    compacted = compact_for_ai(
+        make_json_safe(evidence_package),
+        max_depth=6,
+        max_dict_items=35,
+        max_list_items=12,
+        max_text_length=500,
+    )
+
+    # Historical examples can be large. Keep only the strongest few records
+    # because aggregate memory statistics are already preserved separately.
+    memory = compacted.get("historical_memory", {})
+    if isinstance(memory, dict):
+        matches = memory.get("top_historical_matches")
+        if isinstance(matches, list):
+            memory["top_historical_matches"] = matches[:5]
+
+    return compacted
+
+
+# ============================================================
 # COMPACT TECHNICAL DATA
 #
 # We do not need to send every raw candle to the AI.
@@ -537,7 +625,7 @@ def build_ai_evidence_package(
     memory_analysis: Dict[str, Any],
 ) -> Dict[str, Any]:
 
-    return {
+    package = {
 
         "system":
         "BRADS_SIGNALS_BOT_2",
@@ -575,6 +663,8 @@ def build_ai_evidence_package(
             memory_analysis
         ),
     }
+
+    return compact_evidence_package(package)
 
 
 # ============================================================
@@ -1279,8 +1369,23 @@ def _request_openai(evidence_package: Dict[str, Any]) -> Dict[str, Any]:
     }
     try:
         body = json.dumps(payload, allow_nan=False).encode("utf-8")
-        if len(body) > 24000:
-            return unavailable_ai_result("Evidence package exceeds 24 KB request limit.")
+        if len(body) > AI_REQUEST_MAX_BYTES:
+            # One deterministic tighter compaction pass; no network retry.
+            tighter = compact_for_ai(
+                evidence_package,
+                max_depth=5,
+                max_dict_items=24,
+                max_list_items=6,
+                max_text_length=240,
+            )
+            payload["messages"][1]["content"] = build_user_prompt(tighter)
+            body = json.dumps(payload, allow_nan=False).encode("utf-8")
+
+        if len(body) > AI_REQUEST_MAX_BYTES:
+            return unavailable_ai_result(
+                "Compacted AI request still exceeds 24 KB safety limit."
+            )
+
         request = urllib.request.Request(
             "https://api.openai.com/v1/chat/completions",
             data=body,
