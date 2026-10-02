@@ -93,7 +93,9 @@ REDIS_STATE_PREFIX = "signals2:"
 REDIS_HEALTH_KEY = REDIS_STATE_PREFIX + "health"
 REDIS_WATCHDOG_KEY = REDIS_STATE_PREFIX + "watchdog"
 REDIS_SCANNER_LOCK_KEY = REDIS_STATE_PREFIX + "scanner_lock"
+REDIS_SCANNER_DONE_PREFIX = REDIS_STATE_PREFIX + "scanner_done:"
 REDIS_SCANNER_LOCK_TTL_SECONDS = 240
+REDIS_SCANNER_DONE_TTL_SECONDS = 900
 
 _redis_client = None
 _redis_checked = False
@@ -150,6 +152,17 @@ def redis_write_mapping(key, mapping, ttl_seconds):
         return False
 
 
+def redis_scanner_cycle_done(cycle_token):
+    client = get_redis_client()
+    if client is None:
+        return False
+    try:
+        return bool(client.exists(REDIS_SCANNER_DONE_PREFIX + str(cycle_token)))
+    except Exception as exc:
+        print("REDIS SCANNER DONE CHECK: FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+
+
 def acquire_scanner_cycle_lock(cycle_token):
     client = get_redis_client()
     if client is None:
@@ -164,6 +177,22 @@ def acquire_scanner_cycle_lock(cycle_token):
     except Exception as exc:
         print("REDIS SCANNER LOCK: FAIL OPEN (" + type(exc).__name__ + ")", flush=True)
         return True
+
+
+def mark_scanner_cycle_done(cycle_token):
+    client = get_redis_client()
+    if client is None:
+        return False
+    try:
+        client.set(
+            REDIS_SCANNER_DONE_PREFIX + str(cycle_token),
+            "1",
+            ex=REDIS_SCANNER_DONE_TTL_SECONDS,
+        )
+        return True
+    except Exception as exc:
+        print("REDIS SCANNER DONE WRITE: FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
 
 
 def release_scanner_cycle_lock(cycle_token):
@@ -2197,6 +2226,15 @@ def run_hourly_memory_learning_loop():
             print_health_heartbeat("memory")
             watchdog_status("memory")
         except Exception as exc:
+            if redis_cycle_lock_acquired and redis_cycle_token is not None:
+                release_scanner_cycle_lock(redis_cycle_token)
+                redis_cycle_lock_acquired = False
+                print(
+                    prefix + "REDIS CYCLE LOCK RELEASED AFTER FAILURE token=" +
+                    redis_cycle_token,
+                    flush=True,
+                )
+
             if connection is not None:
                 try:
                     connection.rollback()
@@ -2855,6 +2893,8 @@ def run_controlled_market_scanner():
         scan_cycle_started = time.monotonic()
         print(prefix + "CYCLE " + str(cycle) + ": START", flush=True)
         connection = None
+        redis_cycle_token = None
+        redis_cycle_lock_acquired = False
         try:
             import math
             from datetime import timedelta
@@ -3055,6 +3095,77 @@ def run_controlled_market_scanner():
             observed_at = datetime.fromtimestamp(
                 (reference_stamp + 300000) / 1000,
                 tz=timezone.utc,
+            )
+
+            # Stage 8.8B: Redis distributed cycle guard. The canonical BTC/ETH
+            # closed 5m timestamp is the cycle identity. This prevents two bot
+            # instances/restarts from processing the same market snapshot at
+            # the same time. PostgreSQL duplicate checks remain the durable
+            # second line of defence.
+            redis_cycle_token = str(reference_stamp)
+            if redis_scanner_cycle_done(redis_cycle_token):
+                print(
+                    prefix + "REDIS CYCLE SKIP token=" + redis_cycle_token +
+                    " (already completed)",
+                    flush=True,
+                )
+                scan_duration = round(time.monotonic() - scan_cycle_started, 3)
+                update_health(
+                    last_scan=_utc_health_timestamp(),
+                    last_scan_duration_seconds=scan_duration,
+                    last_error=None,
+                    scanner_failures_consecutive=0,
+                )
+                print_health_heartbeat("scanner_redis_skip")
+                watchdog_status("scanner_redis_skip")
+                if connection is not None:
+                    connection.close()
+                    connection = None
+                if not continuous:
+                    return True
+                now_ts = time.time()
+                next_boundary = ((int(now_ts) // 300) + 1) * 300 + 30
+                wait_seconds = max(1, int(next_boundary - now_ts))
+                print(
+                    prefix + "WAIT (" + str(wait_seconds) +
+                    " seconds until next 5m boundary + 30s)",
+                    flush=True,
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            redis_cycle_lock_acquired = acquire_scanner_cycle_lock(redis_cycle_token)
+            if not redis_cycle_lock_acquired:
+                print(
+                    prefix + "REDIS CYCLE SKIP token=" + redis_cycle_token +
+                    " (lock held by another instance)",
+                    flush=True,
+                )
+                scan_duration = round(time.monotonic() - scan_cycle_started, 3)
+                update_health(
+                    last_scan=_utc_health_timestamp(),
+                    last_scan_duration_seconds=scan_duration,
+                    last_error=None,
+                    scanner_failures_consecutive=0,
+                )
+                print_health_heartbeat("scanner_redis_lock_skip")
+                watchdog_status("scanner_redis_lock_skip")
+                if not continuous:
+                    return True
+                now_ts = time.time()
+                next_boundary = ((int(now_ts) // 300) + 1) * 300 + 30
+                wait_seconds = max(1, int(next_boundary - now_ts))
+                print(
+                    prefix + "WAIT (" + str(wait_seconds) +
+                    " seconds until next 5m boundary + 30s)",
+                    flush=True,
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            print(
+                prefix + "REDIS CYCLE LOCK ACQUIRED token=" + redis_cycle_token,
+                flush=True,
             )
 
             full_context = market_context.build_market_context(
@@ -3345,6 +3456,15 @@ def run_controlled_market_scanner():
                     "; opportunity_failures=" + str(opportunity_failures) +
                     "; sent=" + str(telegram_result.get("sent", 0)) +
                     "; trades=0)",
+                    flush=True,
+                )
+
+            if redis_cycle_lock_acquired and redis_cycle_token is not None:
+                mark_scanner_cycle_done(redis_cycle_token)
+                release_scanner_cycle_lock(redis_cycle_token)
+                redis_cycle_lock_acquired = False
+                print(
+                    prefix + "REDIS CYCLE COMPLETE token=" + redis_cycle_token,
                     flush=True,
                 )
 
