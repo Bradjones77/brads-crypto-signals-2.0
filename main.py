@@ -94,6 +94,8 @@ _health_state = {
     "last_error": None,
     "last_scan_duration_seconds": None,
     "last_memory_duration_seconds": None,
+    "scanner_failures_consecutive": 0,
+    "memory_failures_consecutive": 0,
 }
 
 
@@ -123,6 +125,69 @@ def print_health_heartbeat(source):
         "; last_error=" + str(snapshot["last_error"]),
         flush=True,
     )
+
+
+def watchdog_status(source):
+    """Process-local Stage 8.7 watchdog foundation.
+
+    This observes health only. It does not restart services, send Telegram
+    alerts, change strategy settings, or execute trades.
+    """
+    with _health_lock:
+        snapshot = dict(_health_state)
+
+    issues = []
+    now = datetime.now(timezone.utc)
+
+    def age_seconds(value):
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (now - parsed).total_seconds())
+        except Exception:
+            return None
+
+    scan_age = age_seconds(snapshot["last_scan"])
+    memory_age = age_seconds(snapshot["last_memory_cycle"])
+    db_age = age_seconds(snapshot["last_db_write"])
+
+    # Scanner should normally update every five minutes. Allow a generous
+    # 12-minute window before flagging it stale.
+    if scan_age is not None and scan_age > 720:
+        issues.append("scanner_stale")
+
+    # Hourly memory gets a 90-minute window.
+    if memory_age is not None and memory_age > 5400:
+        issues.append("memory_stale")
+
+    # DB activity is expected during fresh scanner/memory work. Keep the
+    # threshold generous to avoid false alarms around duplicate-candle skips.
+    if db_age is not None and db_age > 1200:
+        issues.append("db_write_stale")
+
+    if int(snapshot["scanner_failures_consecutive"] or 0) >= 3:
+        issues.append("scanner_repeated_failures")
+    if int(snapshot["memory_failures_consecutive"] or 0) >= 2:
+        issues.append("memory_repeated_failures")
+
+    status = "HEALTHY" if not issues else "WARNING"
+    print(
+        "WATCHDOG STATUS: source=" + str(source) +
+        "; status=" + status +
+        "; issues=" + (",".join(issues) if issues else "none") +
+        "; scan_age_seconds=" + str(None if scan_age is None else round(scan_age, 1)) +
+        "; memory_age_seconds=" + str(None if memory_age is None else round(memory_age, 1)) +
+        "; db_age_seconds=" + str(None if db_age is None else round(db_age, 1)) +
+        "; scanner_failures_consecutive=" +
+        str(snapshot["scanner_failures_consecutive"]) +
+        "; memory_failures_consecutive=" +
+        str(snapshot["memory_failures_consecutive"]),
+        flush=True,
+    )
+    return {"status": status, "issues": issues}
 
 
 # ============================================================
@@ -2003,9 +2068,11 @@ def run_hourly_memory_learning_loop():
                 last_memory_cycle=_utc_health_timestamp(),
                 last_memory_duration_seconds=memory_duration,
                 last_error=None,
+                memory_failures_consecutive=0,
             )
             print(prefix + "CYCLE " + str(cycle) + ": PASS (no sends or trades)", flush=True)
             print_health_heartbeat("memory")
+            watchdog_status("memory")
         except Exception as exc:
             if connection is not None:
                 try:
@@ -2023,12 +2090,15 @@ def run_hourly_memory_learning_loop():
                 if secret_value:
                     detail = detail.replace(secret_value, "[REDACTED]")
             memory_duration = round(time.monotonic() - memory_cycle_started, 3)
+            with _health_lock:
+                _health_state["memory_failures_consecutive"] += 1
             update_health(
                 last_memory_cycle=_utc_health_timestamp(),
                 last_memory_duration_seconds=memory_duration,
                 last_error="memory:" + type(exc).__name__,
             )
             print_health_heartbeat("memory_failure")
+            watchdog_status("memory_failure")
             print(prefix + "CYCLE " + str(cycle) + ": OUTCOMES FAIL (" +
                   type(exc).__name__ + "): " + detail, flush=True)
         finally:
@@ -3062,8 +3132,10 @@ def run_controlled_market_scanner():
                     last_scan=_utc_health_timestamp(),
                     last_scan_duration_seconds=scan_duration,
                     last_error=None,
+                    scanner_failures_consecutive=0,
                 )
                 print_health_heartbeat("scanner_skip")
+                watchdog_status("scanner_skip")
                 print(
                     prefix + "CYCLE " + str(cycle) +
                     ": SKIPPED (this closed candle already stored)",
@@ -3134,8 +3206,10 @@ def run_controlled_market_scanner():
                     last_scan=_utc_health_timestamp(),
                     last_scan_duration_seconds=scan_duration,
                     last_error=None,
+                    scanner_failures_consecutive=0,
                 )
                 print_health_heartbeat("scanner")
+                watchdog_status("scanner")
 
                 print(
                     prefix + "CYCLE " + str(cycle) +
@@ -3179,12 +3253,15 @@ def run_controlled_market_scanner():
                     detail = detail.replace(secret_value, "[REDACTED]")
 
             scan_duration = round(time.monotonic() - scan_cycle_started, 3)
+            with _health_lock:
+                _health_state["scanner_failures_consecutive"] += 1
             update_health(
                 last_scan=_utc_health_timestamp(),
                 last_scan_duration_seconds=scan_duration,
                 last_error="scanner:" + type(exc).__name__,
             )
             print_health_heartbeat("scanner_failure")
+            watchdog_status("scanner_failure")
 
             print(
                 prefix + "CYCLE " + str(cycle) + ": FAIL (" +
