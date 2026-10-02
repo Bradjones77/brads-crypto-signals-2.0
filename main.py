@@ -96,6 +96,10 @@ REDIS_SCANNER_LOCK_KEY = REDIS_STATE_PREFIX + "scanner_lock"
 REDIS_SCANNER_DONE_PREFIX = REDIS_STATE_PREFIX + "scanner_done:"
 REDIS_SCANNER_LOCK_TTL_SECONDS = 240
 REDIS_SCANNER_DONE_TTL_SECONDS = 900
+REDIS_SIGNAL_SEND_LOCK_PREFIX = REDIS_STATE_PREFIX + "signal_send_lock:"
+REDIS_SIGNAL_SENT_PREFIX = REDIS_STATE_PREFIX + "signal_sent:"
+REDIS_SIGNAL_SEND_LOCK_TTL_SECONDS = 120
+REDIS_SIGNAL_SENT_TTL_SECONDS = 172800
 
 _redis_client = None
 _redis_checked = False
@@ -1275,6 +1279,59 @@ def store_analysis_batch(
 # ============================================================
 
 
+def redis_signal_already_sent(opportunity_id):
+    client = get_redis_client()
+    if client is None:
+        return False
+    try:
+        return bool(client.exists(REDIS_SIGNAL_SENT_PREFIX + str(opportunity_id)))
+    except Exception as exc:
+        print("REDIS SIGNAL SENT CHECK: FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+
+
+def acquire_signal_send_lock(opportunity_id):
+    client = get_redis_client()
+    if client is None:
+        return True
+    try:
+        return bool(client.set(
+            REDIS_SIGNAL_SEND_LOCK_PREFIX + str(opportunity_id),
+            "1",
+            nx=True,
+            ex=REDIS_SIGNAL_SEND_LOCK_TTL_SECONDS,
+        ))
+    except Exception as exc:
+        print("REDIS SIGNAL SEND LOCK: FAIL CLOSED (" + type(exc).__name__ + ")", flush=True)
+        return False
+
+
+def mark_signal_sent_redis(opportunity_id):
+    client = get_redis_client()
+    if client is None:
+        return False
+    try:
+        client.set(
+            REDIS_SIGNAL_SENT_PREFIX + str(opportunity_id),
+            "1",
+            ex=REDIS_SIGNAL_SENT_TTL_SECONDS,
+        )
+        return True
+    except Exception as exc:
+        print("REDIS SIGNAL SENT WRITE: FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+
+
+def release_signal_send_lock(opportunity_id):
+    client = get_redis_client()
+    if client is None:
+        return
+    try:
+        client.delete(REDIS_SIGNAL_SEND_LOCK_PREFIX + str(opportunity_id))
+    except Exception as exc:
+        print("REDIS SIGNAL SEND UNLOCK: FAIL (" + type(exc).__name__ + ")", flush=True)
+
+
 def send_formatted_signals(
     formatted_signals: List[Dict[str, Any]],
     selected_opportunities: Optional[List[Dict[str, Any]]] = None,
@@ -1364,15 +1421,49 @@ def send_formatted_signals(
         if decision != "SELECTED_NOT_SENT":
             raise RuntimeError("Telegram opportunity is not in sendable state")
 
-        attempted += 1
-        result = telegram_sender.send_signal_record(record)
-
-        if result.get("sent") is not True:
-            # Fail closed. Do not mark sent and do not silently retry here.
-            raise RuntimeError(
-                "Telegram delivery failed: " +
-                str(result.get("reason") or "unknown")
+        # Stage 8.9: Redis is a fast cross-instance send guard. PostgreSQL
+        # remains the durable source of truth. If Redis says this exact
+        # opportunity was already sent, do not send it again.
+        if redis_signal_already_sent(record_id):
+            print(
+                "TELEGRAM REDIS DEDUP: SKIP opportunity_id=" + str(record_id),
+                flush=True,
             )
+            continue
+
+        signal_send_lock_acquired = acquire_signal_send_lock(record_id)
+        if not signal_send_lock_acquired:
+            print(
+                "TELEGRAM REDIS SEND LOCK: SKIP opportunity_id=" + str(record_id),
+                flush=True,
+            )
+            continue
+
+        print(
+            "TELEGRAM REDIS SEND LOCK: ACQUIRED opportunity_id=" + str(record_id),
+            flush=True,
+        )
+
+        attempted += 1
+        try:
+            result = telegram_sender.send_signal_record(record)
+
+            if result.get("sent") is not True:
+                # Fail closed. Do not mark sent and do not silently retry here.
+                raise RuntimeError(
+                    "Telegram delivery failed: " +
+                    str(result.get("reason") or "unknown")
+                )
+
+            # Telegram confirmed receipt. Set the short-term Redis sent marker
+            # before the durable DB update to reduce duplicate-send risk during
+            # a process crash/restart in this narrow window.
+            mark_signal_sent_redis(record_id)
+
+        except Exception:
+            # A failed/unconfirmed send must not leave a live Redis send lock.
+            release_signal_send_lock(record_id)
+            raise
 
         # Only confirmed Telegram success changes the durable sent state.
         with database_connection.cursor() as cursor:
@@ -1390,6 +1481,11 @@ def send_formatted_signals(
             if cursor.rowcount != 1:
                 raise RuntimeError("Telegram sent-state update failed")
         database_connection.commit()
+        release_signal_send_lock(record_id)
+        print(
+            "TELEGRAM REDIS SENT MARKER: SET opportunity_id=" + str(record_id),
+            flush=True,
+        )
         sent += 1
 
     return {
