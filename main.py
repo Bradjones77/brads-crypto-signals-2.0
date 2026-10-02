@@ -2709,40 +2709,67 @@ def run_controlled_market_scanner():
             candles_by_symbol = {}
             prices = {}
             candle_times = {}
+            symbol_failures = 0
+            opportunity_failures = 0
 
-            # Fetch/validate all public market data before any DB write.
+            # Stage 8.5: isolate market-data/analysis failures by symbol.
+            # BTC/ETH remain mandatory reference markets; a failed reference
+            # invalidates the whole snapshot and safely fails this cycle.
+            # A failed non-reference candidate is skipped so the remaining
+            # symbols can still be analysed.
             for symbol in analysis_symbols:
-                candles = bitget_market.get_multi_timeframe_candles(
-                    symbol=symbol,
-                    timeframes=frames,
-                    limit=200,
-                )
-                counts = {frame: len(candles.get(frame, [])) for frame in frames}
-                if any(count < 55 for count in counts.values()):
-                    raise ValueError("Insufficient closed candle history: " + symbol)
+                try:
+                    candles = bitget_market.get_multi_timeframe_candles(
+                        symbol=symbol,
+                        timeframes=frames,
+                        limit=200,
+                    )
+                    counts = {frame: len(candles.get(frame, [])) for frame in frames}
+                    if any(count < 55 for count in counts.values()):
+                        raise ValueError("Insufficient closed candle history")
 
-                analysis = technical_analysis.analyze_symbol(
-                    symbol=symbol,
-                    multi_timeframe_candles=candles,
-                )
-                if not all(
-                    analysis.get("timeframes", {}).get(frame, {}).get("valid")
-                    for frame in frames
-                ):
-                    raise ValueError("Invalid timeframe analysis: " + symbol)
+                    analysis = technical_analysis.analyze_symbol(
+                        symbol=symbol,
+                        multi_timeframe_candles=candles,
+                    )
+                    if not all(
+                        analysis.get("timeframes", {}).get(frame, {}).get("valid")
+                        for frame in frames
+                    ):
+                        raise ValueError("Invalid timeframe analysis")
 
-                last_5m = candles["5m"][-1]
-                price = float(last_5m["close"])
-                stamp = int(last_5m["timestamp"])
-                if not math.isfinite(price) or price <= 0:
-                    raise ValueError("Invalid price: " + symbol)
-                if stamp <= 0 or stamp % 300000:
-                    raise ValueError("Invalid five-minute candle timestamp: " + symbol)
+                    last_5m = candles["5m"][-1]
+                    price = float(last_5m["close"])
+                    stamp = int(last_5m["timestamp"])
+                    if not math.isfinite(price) or price <= 0:
+                        raise ValueError("Invalid price")
+                    if stamp <= 0 or stamp % 300000:
+                        raise ValueError("Invalid five-minute candle timestamp")
 
-                analyses[symbol] = analysis
-                candles_by_symbol[symbol] = candles
-                prices[symbol] = price
-                candle_times[symbol] = stamp
+                    analyses[symbol] = analysis
+                    candles_by_symbol[symbol] = candles
+                    prices[symbol] = price
+                    candle_times[symbol] = stamp
+
+                except Exception as symbol_exc:
+                    if symbol in ("BTCUSDT", "ETHUSDT"):
+                        raise RuntimeError(
+                            "Required reference market failed: " + symbol +
+                            " (" + type(symbol_exc).__name__ + ")"
+                        ) from symbol_exc
+
+                    symbol_failures += 1
+                    print(
+                        prefix + "SYMBOL SKIP " + symbol +
+                        " (" + type(symbol_exc).__name__ + ")",
+                        flush=True,
+                    )
+
+            # Remove failed non-reference symbols from this cycle only.
+            candidate_symbols = [
+                symbol for symbol in candidate_symbols
+                if symbol in analyses
+            ]
 
             reference_times = {
                 candle_times.get("BTCUSDT"), candle_times.get("ETHUSDT")
@@ -2817,36 +2844,50 @@ def run_controlled_market_scanner():
                         skipped_existing += 1
                         continue
 
-                    coin_context = market_context.build_coin_market_context(
-                        coin_analysis=analyses[symbol],
-                        btc_analysis=analyses["BTCUSDT"],
-                        market_context=full_context,
-                        direction=direction,
-                    )
+                    try:
+                        coin_context = market_context.build_coin_market_context(
+                            coin_analysis=analyses[symbol],
+                            btc_analysis=analyses["BTCUSDT"],
+                            market_context=full_context,
+                            direction=direction,
+                        )
 
-                    opportunity = analyse_opportunity(
-                        symbol=symbol,
-                        direction=direction,
-                        current_price=prices[symbol],
-                        multi_timeframe_candles=candles_by_symbol[symbol],
-                        full_market_context=coin_context,
-                        database_connection=connection,
-                        observed_at=observed_at,
-                        use_ai=False,
-                    )
+                        opportunity = analyse_opportunity(
+                            symbol=symbol,
+                            direction=direction,
+                            current_price=prices[symbol],
+                            multi_timeframe_candles=candles_by_symbol[symbol],
+                            full_market_context=coin_context,
+                            database_connection=connection,
+                            observed_at=observed_at,
+                            use_ai=False,
+                        )
 
-                    confidence = opportunity.get("confidence_result") or {}
-                    preliminary_score = float(confidence.get("final_confidence"))
-                    if not math.isfinite(preliminary_score) or not 0 <= preliminary_score <= 100:
-                        raise ValueError("Invalid preliminary confidence score")
+                        confidence = opportunity.get("confidence_result") or {}
+                        preliminary_score = float(confidence.get("final_confidence"))
+                        if (
+                            not math.isfinite(preliminary_score)
+                            or not 0 <= preliminary_score <= 100
+                        ):
+                            raise ValueError("Invalid preliminary confidence score")
 
-                    opportunity["pre_ai_confidence"] = round(preliminary_score, 2)
-                    opportunity["ai_result"] = {
-                        "available": False,
-                        "ai_score": None,
-                        "reason": "Below AI pre-screen threshold",
-                    }
-                    opportunities.append(opportunity)
+                        opportunity["pre_ai_confidence"] = round(preliminary_score, 2)
+                        opportunity["ai_result"] = {
+                            "available": False,
+                            "ai_score": None,
+                            "reason": "Below AI pre-screen threshold",
+                        }
+                        opportunities.append(opportunity)
+
+                    except Exception as opportunity_exc:
+                        opportunity_failures += 1
+                        print(
+                            prefix + "OPPORTUNITY SKIP " + symbol + " " +
+                            direction + " (" +
+                            type(opportunity_exc).__name__ + ")",
+                            flush=True,
+                        )
+                        continue
 
             # Rank all qualifying opportunities before making any AI request.
             # This replaces the old first-qualifying behaviour: AI is now spent
@@ -3015,6 +3056,8 @@ def run_controlled_market_scanner():
                     "; selected=" + str(len(selected)) +
                     "; formatted=" + str(len(formatted)) +
                     "; stored=" + str(stored.get("count")) +
+                    "; symbol_failures=" + str(symbol_failures) +
+                    "; opportunity_failures=" + str(opportunity_failures) +
                     "; sent=" + str(telegram_result.get("sent", 0)) +
                     "; trades=0)",
                     flush=True,
