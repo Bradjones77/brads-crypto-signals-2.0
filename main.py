@@ -1,5 +1,10 @@
 import time
 import threading
+try:
+    import redis
+except Exception:
+    redis = None
+
 import os
 import json
 import urllib.request
@@ -79,6 +84,105 @@ MAX_SIGNALS_PER_BATCH = 5
 
 
 # ============================================================
+# STAGE 8.8 REDIS FOUNDATION
+# PostgreSQL remains permanent history. Redis is optional,
+# short-lived shared state for health/watchdog data and later locks.
+# ============================================================
+
+REDIS_STATE_PREFIX = "signals2:"
+REDIS_HEALTH_KEY = REDIS_STATE_PREFIX + "health"
+REDIS_WATCHDOG_KEY = REDIS_STATE_PREFIX + "watchdog"
+REDIS_SCANNER_LOCK_KEY = REDIS_STATE_PREFIX + "scanner_lock"
+REDIS_SCANNER_LOCK_TTL_SECONDS = 240
+
+_redis_client = None
+_redis_checked = False
+
+
+def get_redis_client():
+    global _redis_client, _redis_checked
+    if _redis_checked:
+        return _redis_client
+
+    _redis_checked = True
+    redis_url = (
+        os.environ.get("SIGNALS2_REDIS_URL", "").strip()
+        or os.environ.get("REDIS_URL", "").strip()
+    )
+    if not redis_url:
+        print("REDIS STATE: DISABLED (no Redis URL configured)", flush=True)
+        return None
+    if redis is None:
+        print("REDIS STATE: DISABLED (redis package unavailable)", flush=True)
+        return None
+
+    try:
+        client = redis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=3,
+            socket_timeout=3,
+            decode_responses=True,
+        )
+        client.ping()
+        _redis_client = client
+        print("REDIS STATE: READY", flush=True)
+        return _redis_client
+    except Exception as exc:
+        print("REDIS STATE: UNAVAILABLE (" + type(exc).__name__ + ")", flush=True)
+        _redis_client = None
+        return None
+
+
+def redis_write_mapping(key, mapping, ttl_seconds):
+    client = get_redis_client()
+    if client is None:
+        return False
+    safe_mapping = {
+        str(k): ("None" if v is None else str(v))
+        for k, v in mapping.items()
+    }
+    try:
+        client.hset(key, mapping=safe_mapping)
+        client.expire(key, int(ttl_seconds))
+        return True
+    except Exception as exc:
+        print("REDIS STATE WRITE: FAIL (" + type(exc).__name__ + ")", flush=True)
+        return False
+
+
+def acquire_scanner_cycle_lock(cycle_token):
+    client = get_redis_client()
+    if client is None:
+        return True
+    try:
+        return bool(client.set(
+            REDIS_SCANNER_LOCK_KEY,
+            str(cycle_token),
+            nx=True,
+            ex=REDIS_SCANNER_LOCK_TTL_SECONDS,
+        ))
+    except Exception as exc:
+        print("REDIS SCANNER LOCK: FAIL OPEN (" + type(exc).__name__ + ")", flush=True)
+        return True
+
+
+def release_scanner_cycle_lock(cycle_token):
+    client = get_redis_client()
+    if client is None:
+        return
+    script = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+        return redis.call('del', KEYS[1])
+    end
+    return 0
+    """
+    try:
+        client.eval(script, 1, REDIS_SCANNER_LOCK_KEY, str(cycle_token))
+    except Exception as exc:
+        print("REDIS SCANNER UNLOCK: FAIL (" + type(exc).__name__ + ")", flush=True)
+
+
+# ============================================================
 # STAGE 8.6 HEALTH / HEARTBEAT STATE
 # Process-local, non-secret health telemetry. A later watchdog/Redis
 # stage can persist/share equivalent fields across services.
@@ -124,6 +228,11 @@ def print_health_heartbeat(source):
         "; last_memory_duration_seconds=" + str(snapshot["last_memory_duration_seconds"]) +
         "; last_error=" + str(snapshot["last_error"]),
         flush=True,
+    )
+    redis_write_mapping(
+        REDIS_HEALTH_KEY,
+        {"source": source, **snapshot},
+        ttl_seconds=7200,
     )
 
 
@@ -186,6 +295,20 @@ def watchdog_status(source):
         "; memory_failures_consecutive=" +
         str(snapshot["memory_failures_consecutive"]),
         flush=True,
+    )
+    redis_write_mapping(
+        REDIS_WATCHDOG_KEY,
+        {
+            "source": source,
+            "status": status,
+            "issues": ",".join(issues) if issues else "none",
+            "scan_age_seconds": None if scan_age is None else round(scan_age, 1),
+            "memory_age_seconds": None if memory_age is None else round(memory_age, 1),
+            "db_age_seconds": None if db_age is None else round(db_age, 1),
+            "scanner_failures_consecutive": snapshot["scanner_failures_consecutive"],
+            "memory_failures_consecutive": snapshot["memory_failures_consecutive"],
+        },
+        ttl_seconds=7200,
     )
     return {"status": status, "issues": issues}
 
@@ -3291,6 +3414,7 @@ def run_controlled_market_scanner():
 
 
 if __name__ == "__main__":
+    get_redis_client()
 
     try:
 
