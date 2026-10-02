@@ -2847,10 +2847,9 @@ def run_controlled_market_scanner():
             opportunities = []
             skipped_existing = 0
 
-            global _ai_scan_budget_active, _ai_scan_calls_remaining
-            _ai_scan_budget_active = ai_enabled
-            _ai_scan_calls_remaining = AI_MAX_CALLS_PER_SCAN if ai_enabled else 0
-
+            # Stage 8.3: build every opportunity without AI first. This gives
+            # every direction the same cheap technical/market/memory pre-score
+            # before any OpenAI request is spent.
             for symbol in candidate_symbols:
                 for direction in ("LONG", "SHORT"):
                     if (symbol, direction) in existing:
@@ -2872,56 +2871,119 @@ def run_controlled_market_scanner():
                         full_market_context=coin_context,
                         database_connection=connection,
                         observed_at=observed_at,
+                        use_ai=False,
                     )
 
                     confidence = opportunity.get("confidence_result") or {}
-                    score = float(confidence.get("final_confidence"))
-                    if not math.isfinite(score) or not 0 <= score <= 100:
-                        raise ValueError("Invalid confidence score")
-                    if confidence.get("eligible") and (
-                        score < MINIMUM_SIGNAL_CONFIDENCE
-                        or (confidence.get("evidence_gates") or {}).get("passed") is not True
-                    ):
-                        raise ValueError("Confidence eligibility gate violation")
+                    preliminary_score = float(confidence.get("final_confidence"))
+                    if not math.isfinite(preliminary_score) or not 0 <= preliminary_score <= 100:
+                        raise ValueError("Invalid preliminary confidence score")
 
+                    opportunity["pre_ai_confidence"] = round(preliminary_score, 2)
+                    opportunity["ai_result"] = {
+                        "available": False,
+                        "ai_score": None,
+                        "reason": "Below AI pre-screen threshold",
+                    }
                     opportunities.append(opportunity)
-                    ai_result = opportunity.get("ai_result") or {}
-                    ai_available = bool(ai_result.get("available"))
-                    ai_reason = ""
-                    if opportunity.get("pre_ai_confidence") is not None and not ai_available:
-                        raw_reason = (
-                            ai_result.get("reasoning_summary")
-                            or ai_result.get("reason")
-                            or ai_result.get("error_type")
-                            or "unavailable"
-                        )
-                        ai_reason = (
-                            "; ai_reason=" +
-                            str(raw_reason).replace("\n", " ").replace("\r", " ")[:160]
-                        )
 
-                    print(
-                        prefix + symbol + " " + direction +
-                        "; confidence=" + str(round(score, 2)) +
-                        "; memory_usable=" +
-                        str(bool((opportunity.get("memory_analysis") or {}).get("memory_usable"))) +
-                        "; ai_available=" + str(ai_available) +
-                        ai_reason,
-                        flush=True,
-                    )
-
+            # Rank all qualifying opportunities before making any AI request.
+            # This replaces the old first-qualifying behaviour: AI is now spent
+            # only on the strongest preliminary opportunities in this scan.
+            ai_ranked = []
             if ai_enabled:
+                ai_ranked = sorted(
+                    [
+                        opportunity for opportunity in opportunities
+                        if float(opportunity.get("pre_ai_confidence", 0.0))
+                        >= AI_PRE_SCREEN_THRESHOLD
+                    ],
+                    key=lambda opportunity: (
+                        -float(opportunity.get("pre_ai_confidence", 0.0)),
+                        str(opportunity.get("symbol", "")),
+                        str(opportunity.get("direction", "")),
+                    ),
+                )
+
+            ai_targets = ai_ranked[:AI_MAX_CALLS_PER_SCAN]
+            ai_target_ids = {id(opportunity) for opportunity in ai_targets}
+
+            for rank, opportunity in enumerate(ai_targets, start=1):
+                opportunity["ai_rank"] = rank
+                opportunity = run_ai_stage(opportunity)
+                opportunity = run_confidence_stage(opportunity)
+
+            for opportunity in opportunities:
+                if (
+                    ai_enabled
+                    and float(opportunity.get("pre_ai_confidence", 0.0))
+                    >= AI_PRE_SCREEN_THRESHOLD
+                    and id(opportunity) not in ai_target_ids
+                ):
+                    opportunity["ai_result"] = {
+                        "available": False,
+                        "ai_score": None,
+                        "reason": "Outside top ranked AI slots",
+                    }
+                    opportunity = run_confidence_stage(opportunity)
+
+                confidence = opportunity.get("confidence_result") or {}
+                score = float(confidence.get("final_confidence"))
+                if not math.isfinite(score) or not 0 <= score <= 100:
+                    raise ValueError("Invalid confidence score")
+                if confidence.get("eligible") and (
+                    score < MINIMUM_SIGNAL_CONFIDENCE
+                    or (confidence.get("evidence_gates") or {}).get("passed") is not True
+                ):
+                    raise ValueError("Confidence eligibility gate violation")
+
+                ai_result = opportunity.get("ai_result") or {}
+                ai_available = bool(ai_result.get("available"))
+                raw_reason = (
+                    ai_result.get("reasoning_summary")
+                    or ai_result.get("reason")
+                    or ai_result.get("error_type")
+                    or "unavailable"
+                )
+                ai_reason = "" if ai_available else (
+                    "; ai_reason=" +
+                    str(raw_reason).replace("\n", " ").replace("\r", " ")[:160]
+                )
+                ai_rank_text = (
+                    "; ai_rank=" + str(opportunity.get("ai_rank"))
+                    if opportunity.get("ai_rank") is not None else ""
+                )
+
                 print(
-                    prefix + "AI PRE-SCREEN threshold=" +
-                    str(AI_PRE_SCREEN_THRESHOLD) +
-                    "; max_calls=" + str(AI_MAX_CALLS_PER_SCAN) +
-                    "; request_slots_used=" +
-                    str(AI_MAX_CALLS_PER_SCAN - _ai_scan_calls_remaining),
+                    prefix + str(opportunity.get("symbol")) + " " +
+                    str(opportunity.get("direction")) +
+                    "; pre_ai_confidence=" +
+                    str(opportunity.get("pre_ai_confidence")) +
+                    "; confidence=" + str(round(score, 2)) +
+                    "; memory_usable=" +
+                    str(bool((opportunity.get("memory_analysis") or {}).get("memory_usable"))) +
+                    "; ai_available=" + str(ai_available) +
+                    ai_rank_text +
+                    ai_reason,
                     flush=True,
                 )
 
-            _ai_scan_budget_active = False
-            _ai_scan_calls_remaining = 0
+            if ai_enabled:
+                ranked_summary = ", ".join(
+                    str(opportunity.get("symbol")) + " " +
+                    str(opportunity.get("direction")) + "=" +
+                    str(opportunity.get("pre_ai_confidence"))
+                    for opportunity in ai_targets
+                ) or "none"
+                print(
+                    prefix + "AI RANKING threshold=" +
+                    str(AI_PRE_SCREEN_THRESHOLD) +
+                    "; qualifying=" + str(len(ai_ranked)) +
+                    "; max_calls=" + str(AI_MAX_CALLS_PER_SCAN) +
+                    "; request_slots_used=" + str(len(ai_targets)) +
+                    "; targets=" + ranked_summary,
+                    flush=True,
+                )
 
             if not opportunities:
                 print(
