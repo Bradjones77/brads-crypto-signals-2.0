@@ -79,6 +79,53 @@ MAX_SIGNALS_PER_BATCH = 5
 
 
 # ============================================================
+# STAGE 8.6 HEALTH / HEARTBEAT STATE
+# Process-local, non-secret health telemetry. A later watchdog/Redis
+# stage can persist/share equivalent fields across services.
+# ============================================================
+
+_health_lock = threading.Lock()
+_health_state = {
+    "last_scan": None,
+    "last_memory_cycle": None,
+    "last_ai_success": None,
+    "last_db_write": None,
+    "last_telegram_success": None,
+    "last_error": None,
+    "last_scan_duration_seconds": None,
+    "last_memory_duration_seconds": None,
+}
+
+
+def _utc_health_timestamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def update_health(**fields):
+    with _health_lock:
+        for key, value in fields.items():
+            if key in _health_state:
+                _health_state[key] = value
+
+
+def print_health_heartbeat(source):
+    with _health_lock:
+        snapshot = dict(_health_state)
+    print(
+        "HEALTH HEARTBEAT: source=" + str(source) +
+        "; last_scan=" + str(snapshot["last_scan"]) +
+        "; last_memory_cycle=" + str(snapshot["last_memory_cycle"]) +
+        "; last_ai_success=" + str(snapshot["last_ai_success"]) +
+        "; last_db_write=" + str(snapshot["last_db_write"]) +
+        "; last_telegram_success=" + str(snapshot["last_telegram_success"]) +
+        "; last_scan_duration_seconds=" + str(snapshot["last_scan_duration_seconds"]) +
+        "; last_memory_duration_seconds=" + str(snapshot["last_memory_duration_seconds"]) +
+        "; last_error=" + str(snapshot["last_error"]),
+        flush=True,
+    )
+
+
+# ============================================================
 # SAFE IMPORTS
 #
 # During the build stage, some integrations may deliberately
@@ -1896,6 +1943,7 @@ def run_hourly_memory_learning_loop():
             return False
 
         cycle += 1
+        memory_cycle_started = time.monotonic()
         print(prefix + "CYCLE " + str(cycle) + ": START", flush=True)
 
         try:
@@ -1950,7 +1998,14 @@ def run_hourly_memory_learning_loop():
             print(prefix + "CYCLE " + str(cycle) + ": OUTCOMES checked=" +
                   str(len(records)) + "; updated=" + str(updated) +
                   "; completed=" + str(completed) + "; waiting=" + str(waiting), flush=True)
+            memory_duration = round(time.monotonic() - memory_cycle_started, 3)
+            update_health(
+                last_memory_cycle=_utc_health_timestamp(),
+                last_memory_duration_seconds=memory_duration,
+                last_error=None,
+            )
             print(prefix + "CYCLE " + str(cycle) + ": PASS (no sends or trades)", flush=True)
+            print_health_heartbeat("memory")
         except Exception as exc:
             if connection is not None:
                 try:
@@ -1967,6 +2022,13 @@ def run_hourly_memory_learning_loop():
                 secret_value = os.environ.get(secret_name)
                 if secret_value:
                     detail = detail.replace(secret_value, "[REDACTED]")
+            memory_duration = round(time.monotonic() - memory_cycle_started, 3)
+            update_health(
+                last_memory_cycle=_utc_health_timestamp(),
+                last_memory_duration_seconds=memory_duration,
+                last_error="memory:" + type(exc).__name__,
+            )
+            print_health_heartbeat("memory_failure")
             print(prefix + "CYCLE " + str(cycle) + ": OUTCOMES FAIL (" +
                   type(exc).__name__ + "): " + detail, flush=True)
         finally:
@@ -2597,6 +2659,7 @@ def run_controlled_market_scanner():
     cycle = 0
     while True:
         cycle += 1
+        scan_cycle_started = time.monotonic()
         print(prefix + "CYCLE " + str(cycle) + ": START", flush=True)
         connection = None
         try:
@@ -2970,6 +3033,12 @@ def run_controlled_market_scanner():
                     flush=True,
                 )
 
+            if any(
+                bool((opportunity.get("ai_result") or {}).get("available"))
+                for opportunity in opportunities
+            ):
+                update_health(last_ai_success=_utc_health_timestamp())
+
             if ai_enabled:
                 ranked_summary = ", ".join(
                     str(opportunity.get("symbol")) + " " +
@@ -2988,6 +3057,13 @@ def run_controlled_market_scanner():
                 )
 
             if not opportunities:
+                scan_duration = round(time.monotonic() - scan_cycle_started, 3)
+                update_health(
+                    last_scan=_utc_health_timestamp(),
+                    last_scan_duration_seconds=scan_duration,
+                    last_error=None,
+                )
+                print_health_heartbeat("scanner_skip")
                 print(
                     prefix + "CYCLE " + str(cycle) +
                     ": SKIPPED (this closed candle already stored)",
@@ -3008,6 +3084,7 @@ def run_controlled_market_scanner():
                 )
                 if not stored.get("stored") or stored.get("count") != len(opportunities):
                     raise RuntimeError("Scanner memory storage incomplete")
+                update_health(last_db_write=_utc_health_timestamp())
 
                 for candidate in selected:
                     confidence = candidate.get("confidence_result") or {}
@@ -3049,6 +3126,17 @@ def run_controlled_market_scanner():
                         database_connection=connection,
                     )
 
+                if int(telegram_result.get("sent", 0) or 0) > 0:
+                    update_health(last_telegram_success=_utc_health_timestamp())
+
+                scan_duration = round(time.monotonic() - scan_cycle_started, 3)
+                update_health(
+                    last_scan=_utc_health_timestamp(),
+                    last_scan_duration_seconds=scan_duration,
+                    last_error=None,
+                )
+                print_health_heartbeat("scanner")
+
                 print(
                     prefix + "CYCLE " + str(cycle) +
                     ": PASS (analysed=" + str(len(opportunities)) +
@@ -3089,6 +3177,14 @@ def run_controlled_market_scanner():
                 secret_value = os.environ.get(secret_name)
                 if secret_value:
                     detail = detail.replace(secret_value, "[REDACTED]")
+
+            scan_duration = round(time.monotonic() - scan_cycle_started, 3)
+            update_health(
+                last_scan=_utc_health_timestamp(),
+                last_scan_duration_seconds=scan_duration,
+                last_error="scanner:" + type(exc).__name__,
+            )
+            print_health_heartbeat("scanner_failure")
 
             print(
                 prefix + "CYCLE " + str(cycle) + ": FAIL (" +
