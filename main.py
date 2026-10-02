@@ -1032,8 +1032,8 @@ def store_analysis_batch(
             rejection_reason=reason,
             signal_sent=False,
             ai_analysis=opportunity.get("ai_result") or {},
-            model_version="STEP4.12_NO_AI",
-            strategy_version="STEP4.12_BATCH_MEMORY",
+            model_version="SIGNALS2_AI_INTEGRATED_V1",
+            strategy_version="SIGNALS2_SCANNER_MEMORY_AI_V1",
             created_at=opportunity["observed_at"],
         )
         stored_ids.append(record_id)
