@@ -94,3 +94,39 @@ def run():
             raise RuntimeError("Static Telegram sending flag is enabled")
         if float(main.MINIMUM_SIGNAL_CONFIDENCE) != 80.0:
             raise RuntimeError("Minimum confidence changed")
+        print(PREFIX + "CHECK 4 PASS - development safety flags and 80 threshold intact", flush=True)
+
+        # ----------------------------------------------------
+        # Check 5: no trade execution should exist in this bot.
+        # ----------------------------------------------------
+        forbidden = (
+            "place_order",
+            "execute_trade",
+            "open_position",
+            "submit_order",
+        )
+        present = [name for name in forbidden if callable(getattr(main, name, None))]
+        if present:
+            raise RuntimeError("Trade execution callable detected")
+        print(PREFIX + "CHECK 5 PASS - no trade execution callable detected", flush=True)
+
+        print(PREFIX + "PASS - controlled failure-resilience checks verified", flush=True)
+        return True
+
+    finally:
+        main.get_redis_client = original_get_redis_client
+        try:
+            client = main.get_redis_client()
+            if client is not None:
+                test_id = "SIGNALS2_STAGE8_10_CLEANUP_TEST"
+                client.delete(
+                    main.REDIS_SIGNAL_SEND_LOCK_PREFIX + test_id,
+                    main.REDIS_SIGNAL_SENT_PREFIX + test_id,
+                )
+            print(PREFIX + "CLEANUP PASS", flush=True)
+        except Exception as exc:
+            print(PREFIX + "CLEANUP FAIL (" + type(exc).__name__ + ")", flush=True)
+
+
+if __name__ == "__main__":
+    run()
