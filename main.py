@@ -544,17 +544,18 @@ def run_memory_stage(
 
 
 # ============================================================
-# CONTROLLED AI SCAN BUDGET
+# CONTROLLED AI SCAN LIMITS
 #
 # Normal scanning uses cheap technical/market/memory evidence first.
-# Only promising opportunities are sent to AI, with a strict
-# per-scan request cap. This does not change the final 80/100 gate.
+# The scanner ranks all qualifying opportunities and passes only the
+# strongest local per-cycle targets to AI. No mutable global AI budget
+# state is used, so a failed AI request or scanner cycle cannot leave
+# request-budget state stuck for the next cycle.
+# This does not change the final 80/100 gate.
 # ============================================================
 
 AI_PRE_SCREEN_THRESHOLD = 65.0
 AI_MAX_CALLS_PER_SCAN = 3
-_ai_scan_budget_active = False
-_ai_scan_calls_remaining = 0
 
 
 # ============================================================
@@ -568,8 +569,6 @@ _ai_scan_calls_remaining = 0
 def run_ai_stage(
     opportunity: Dict[str, Any],
 ) -> Dict[str, Any]:
-
-    global _ai_scan_calls_remaining
 
     unavailable = {
         "available": False,
@@ -589,47 +588,9 @@ def run_ai_stage(
         opportunity["ai_result"] = dict(unavailable)
         return opportunity
 
-    # During the continuous scanner, pre-screen with the existing
-    # confidence engine while AI is unavailable. This prevents weak
-    # opportunities from consuming OpenAI requests.
-    if _ai_scan_budget_active:
-        if confidence_engine is None:
-            opportunity["ai_result"] = dict(unavailable)
-            opportunity["ai_result"]["reason"] = "Confidence engine unavailable"
-            return opportunity
-
-        try:
-            preliminary = confidence_engine.calculate_final_confidence(
-                symbol=opportunity["symbol"],
-                direction=opportunity["direction"],
-                technical_analysis=opportunity.get("technical_analysis", {}),
-                market_context=opportunity.get("market_context", {}),
-                memory_analysis=opportunity.get("memory_analysis", {}),
-                ai_result=dict(unavailable),
-            )
-            preliminary_score = float(
-                (preliminary or {}).get("final_confidence", 0.0)
-            )
-        except Exception:
-            opportunity["ai_result"] = dict(unavailable)
-            opportunity["ai_result"]["reason"] = "AI pre-screen failed"
-            return opportunity
-
-        opportunity["pre_ai_confidence"] = round(preliminary_score, 2)
-
-        if preliminary_score < AI_PRE_SCREEN_THRESHOLD:
-            opportunity["ai_result"] = dict(unavailable)
-            opportunity["ai_result"]["reason"] = "Below AI pre-screen threshold"
-            return opportunity
-
-        if _ai_scan_calls_remaining <= 0:
-            opportunity["ai_result"] = dict(unavailable)
-            opportunity["ai_result"]["reason"] = "AI scan budget exhausted"
-            return opportunity
-
-        # Reserve the request slot before the network call so failures
-        # cannot accidentally exceed the per-cycle cap.
-        _ai_scan_calls_remaining -= 1
+    # Stage 8.4: AI request limiting is owned by the scanner's local
+    # ranked target list. run_ai_stage() therefore has no cross-cycle
+    # mutable budget state to reset or accidentally leave stuck.
 
     try:
         result = ai_analyst.analyze_with_ai(
