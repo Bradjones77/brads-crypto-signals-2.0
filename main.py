@@ -2224,6 +2224,254 @@ def run_automatic_observation_collector():
 
 
 # ============================================================
+# CONTINUOUS OUTCOME TRACKING WORKER (OPT-IN WITH SCANNER)
+#
+# Purpose:
+# - keep current integrated-model outcomes from being starved by the old backlog
+# - still drain a controlled share of the legitimate historical backlog
+# - exclude synthetic SIGNALS2* diagnostic symbols from public-market lookups
+# - only process rows old enough for the final 24h checkpoint, allowing one
+#   historical reconstruction to populate all required checkpoints at once
+#
+# Safety:
+# - no Telegram sends
+# - no trade execution
+# - no confidence / AI / selector changes
+# - PostgreSQL advisory lock prevents overlap with the hourly memory updater
+# ============================================================
+
+OUTCOME_WORKER_RECENT_LIMIT = 240
+OUTCOME_WORKER_BACKLOG_LIMIT = 60
+OUTCOME_WORKER_ADVISORY_LOCK = 220250926
+
+
+def run_continuous_outcome_tracking_loop():
+    prefix = "OUTCOME TRACKER WORKER: "
+
+    if not DEVELOPMENT_MODE or LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
+        print(prefix + "BLOCKED (safety settings)", flush=True)
+        return False
+
+    if memory_engine is None or outcome_tracker is None:
+        print(prefix + "BLOCKED (memory/outcome module unavailable)", flush=True)
+        return False
+
+    print(
+        prefix +
+        "START (hourly; recent integrated quota=" +
+        str(OUTCOME_WORKER_RECENT_LIMIT) +
+        "; backlog quota=" + str(OUTCOME_WORKER_BACKLOG_LIMIT) +
+        "; mature >=24h5m only; no sends or trades)",
+        flush=True,
+    )
+
+    cycle = 0
+
+    while True:
+        # Run five minutes after each UTC hour. This keeps it away from the
+        # hourly-memory collection at :00:30 and gives Bitget time to publish
+        # the latest closed candles.
+        now = time.time()
+        next_hour = (int(now) // 3600 + 1) * 3600
+        wait = max(0.0, next_hour + 300 - now)
+        print(prefix + "WAIT (" + str(int(wait)) + " seconds until next cycle)", flush=True)
+        time.sleep(wait)
+
+        if LIVE_SCANNING_ENABLED or TELEGRAM_SENDING_ENABLED:
+            print(prefix + "STOPPED (safety settings changed)", flush=True)
+            return False
+
+        cycle += 1
+        connection = None
+        lock_acquired = False
+        started = time.monotonic()
+
+        print(prefix + "CYCLE " + str(cycle) + ": START", flush=True)
+
+        try:
+            connection = memory_engine.connect()
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_try_advisory_lock(%s)",
+                    (OUTCOME_WORKER_ADVISORY_LOCK,),
+                )
+                lock_acquired = bool(cursor.fetchone()[0])
+
+            if not lock_acquired:
+                print(
+                    prefix + "CYCLE " + str(cycle) +
+                    ": SKIPPED (another outcome updater is running)",
+                    flush=True,
+                )
+                continue
+
+            real_dict_cursor = __import__(
+                "psycopg2.extras",
+                fromlist=["RealDictCursor"],
+            ).RealDictCursor
+
+            # Quota A: protect the current integrated model from starvation.
+            # We take the newest mature integrated rows first. At the scanner's
+            # normal 20 opportunities / 5 minutes, 240 rows covers one hour of
+            # newly maturing observations.
+            with connection.cursor(cursor_factory=real_dict_cursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT r.*
+                    FROM signals2_outcomes r
+                    JOIN signals2_opportunities o
+                      ON o.opportunity_id = r.opportunity_id
+                    WHERE r.outcome_complete = FALSE
+                      AND r.opportunity_time <=
+                          (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours 5 minutes'
+                      AND r.symbol NOT LIKE 'SIGNALS2%'
+                      AND o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                    ORDER BY r.opportunity_time DESC
+                    LIMIT %s
+                    """,
+                    (OUTCOME_WORKER_RECENT_LIMIT,),
+                )
+                recent_records = [dict(row) for row in cursor.fetchall()]
+
+            recent_ids = [row["opportunity_id"] for row in recent_records]
+
+            # Quota B: drain old legitimate rows without allowing them to
+            # monopolise the worker. Synthetic diagnostic rows stay excluded.
+            with connection.cursor(cursor_factory=real_dict_cursor) as cursor:
+                if recent_ids:
+                    cursor.execute(
+                        """
+                        SELECT r.*
+                        FROM signals2_outcomes r
+                        WHERE r.outcome_complete = FALSE
+                          AND r.opportunity_time <=
+                              (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours 5 minutes'
+                          AND r.symbol NOT LIKE 'SIGNALS2%'
+                          AND NOT (r.opportunity_id = ANY(%s))
+                        ORDER BY r.opportunity_time ASC
+                        LIMIT %s
+                        """,
+                        (recent_ids, OUTCOME_WORKER_BACKLOG_LIMIT),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT r.*
+                        FROM signals2_outcomes r
+                        WHERE r.outcome_complete = FALSE
+                          AND r.opportunity_time <=
+                              (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours 5 minutes'
+                          AND r.symbol NOT LIKE 'SIGNALS2%'
+                        ORDER BY r.opportunity_time ASC
+                        LIMIT %s
+                        """,
+                        (OUTCOME_WORKER_BACKLOG_LIMIT,),
+                    )
+                backlog_records = [dict(row) for row in cursor.fetchall()]
+
+            records = recent_records + backlog_records
+            updated = 0
+            completed = 0
+            waiting = 0
+            errors = 0
+
+            print(
+                prefix + "CYCLE " + str(cycle) +
+                ": QUEUE recent=" + str(len(recent_records)) +
+                "; backlog=" + str(len(backlog_records)) +
+                "; total=" + str(len(records)),
+                flush=True,
+            )
+
+            for record in records:
+                try:
+                    result = outcome_tracker.update_one_outcome(connection, record)
+                    updated += int(bool(result.get("updated")))
+
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT outcome_complete FROM signals2_outcomes "
+                            "WHERE opportunity_id=%s",
+                            (record["opportunity_id"],),
+                        )
+                        row = cursor.fetchone()
+
+                    is_complete = bool(row and row[0])
+                    completed += int(is_complete)
+                    waiting += int(not is_complete)
+
+                except Exception as exc:
+                    errors += 1
+                    try:
+                        connection.rollback()
+                    except Exception:
+                        pass
+                    print(
+                        prefix + "RECORD ERROR symbol=" +
+                        str(record.get("symbol")) +
+                        "; type=" + type(exc).__name__,
+                        flush=True,
+                    )
+
+            duration = round(time.monotonic() - started, 3)
+            print(
+                prefix + "CYCLE " + str(cycle) +
+                ": OUTCOMES checked=" + str(len(records)) +
+                "; updated=" + str(updated) +
+                "; completed=" + str(completed) +
+                "; waiting=" + str(waiting) +
+                "; errors=" + str(errors) +
+                "; duration_seconds=" + str(duration),
+                flush=True,
+            )
+            print(
+                prefix + "CYCLE " + str(cycle) +
+                ": PASS (no sends or trades)",
+                flush=True,
+            )
+
+        except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+
+            detail = str(exc).replace("\n", " ").replace("\r", " ")[:500]
+            for secret_name in (
+                "SIGNALS2_DATABASE_URL", "DATABASE_URL",
+                "BITGET_API_KEY", "BITGET_SECRET_KEY",
+                "BITGET_PASSPHRASE", "OPENAI_API_KEY",
+            ):
+                secret_value = os.environ.get(secret_name)
+                if secret_value:
+                    detail = detail.replace(secret_value, "[REDACTED]")
+
+            print(
+                prefix + "CYCLE " + str(cycle) + ": FAIL (" +
+                type(exc).__name__ + "): " + detail,
+                flush=True,
+            )
+
+        finally:
+            if connection is not None:
+                if lock_acquired:
+                    try:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT pg_advisory_unlock(%s)",
+                                (OUTCOME_WORKER_ADVISORY_LOCK,),
+                            )
+                    except Exception:
+                        pass
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+
+# ============================================================
 # HOURLY MEMORY LEARNING LOOP (OPT-IN)
 # Collects one BTC/ETH LONG/SHORT observation batch per hour and then
 # completes mature outcomes once they are at least 24h + 5m old.
@@ -3670,13 +3918,14 @@ if __name__ == "__main__":
             os.environ.get("SIGNALS2_HOURLY_MEMORY_LOOP_ON_START", "").lower().strip() == "true"
         )
 
-        # In continuous development scanning, keep the hourly learning loop alive
-        # in a separate daemon thread. The scanner remains on the main thread so
+        # In continuous development scanning, keep both learning workers alive
+        # in separate daemon threads. The scanner remains on the main thread so
         # an unexpected scanner failure still fails visibly instead of being hidden.
         if scanner_on_start and scanner_continuous and hourly_memory_on_start:
             print(
                 "CONTROLLER: STARTING HOURLY MEMORY WORKER "
-                "(parallel with continuous controlled scanner)"
+                "(parallel with continuous controlled scanner)",
+                flush=True,
             )
             memory_thread = threading.Thread(
                 target=run_hourly_memory_learning_loop,
@@ -3684,6 +3933,19 @@ if __name__ == "__main__":
                 daemon=True,
             )
             memory_thread.start()
+
+            print(
+                "CONTROLLER: STARTING OUTCOME TRACKER WORKER "
+                "(fair recent + backlog quotas; no sends or trades)",
+                flush=True,
+            )
+            outcome_thread = threading.Thread(
+                target=run_continuous_outcome_tracking_loop,
+                name="signals2-outcome-tracker",
+                daemon=True,
+            )
+            outcome_thread.start()
+
             run_controlled_market_scanner()
 
         else:
