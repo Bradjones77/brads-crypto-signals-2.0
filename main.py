@@ -2325,7 +2325,7 @@ def run_continuous_outcome_tracking_loop():
                     WHERE r.outcome_complete = FALSE
                       AND r.opportunity_time <=
                           (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours 5 minutes'
-                      AND r.symbol NOT LIKE 'SIGNALS2%'
+                      AND r.symbol NOT LIKE 'SIGNALS2%%'
                       AND o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
                     ORDER BY r.opportunity_time DESC
                     LIMIT %s
@@ -2347,7 +2347,7 @@ def run_continuous_outcome_tracking_loop():
                         WHERE r.outcome_complete = FALSE
                           AND r.opportunity_time <=
                               (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours 5 minutes'
-                          AND r.symbol NOT LIKE 'SIGNALS2%'
+                          AND r.symbol NOT LIKE 'SIGNALS2%%'
                           AND NOT (r.opportunity_id = ANY(%s))
                         ORDER BY r.opportunity_time ASC
                         LIMIT %s
@@ -2362,7 +2362,7 @@ def run_continuous_outcome_tracking_loop():
                         WHERE r.outcome_complete = FALSE
                           AND r.opportunity_time <=
                               (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours 5 minutes'
-                          AND r.symbol NOT LIKE 'SIGNALS2%'
+                          AND r.symbol NOT LIKE 'SIGNALS2%%'
                         ORDER BY r.opportunity_time ASC
                         LIMIT %s
                         """,
