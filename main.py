@@ -231,6 +231,12 @@ _health_state = {
     "last_error": None,
     "last_scan_duration_seconds": None,
     "last_memory_duration_seconds": None,
+    "outcome_worker_started": None,
+    "last_outcome_cycle": None,
+    "last_outcome_success": None,
+    "last_outcome_duration_seconds": None,
+    "last_outcome_error": None,
+    "outcome_failures_consecutive": 0,
     "scanner_failures_consecutive": 0,
     "memory_failures_consecutive": 0,
 }
@@ -259,6 +265,12 @@ def print_health_heartbeat(source):
         "; last_telegram_success=" + str(snapshot["last_telegram_success"]) +
         "; last_scan_duration_seconds=" + str(snapshot["last_scan_duration_seconds"]) +
         "; last_memory_duration_seconds=" + str(snapshot["last_memory_duration_seconds"]) +
+        "; outcome_worker_started=" + str(snapshot["outcome_worker_started"]) +
+        "; last_outcome_cycle=" + str(snapshot["last_outcome_cycle"]) +
+        "; last_outcome_success=" + str(snapshot["last_outcome_success"]) +
+        "; last_outcome_duration_seconds=" + str(snapshot["last_outcome_duration_seconds"]) +
+        "; last_outcome_error=" + str(snapshot["last_outcome_error"]) +
+        "; outcome_failures_consecutive=" + str(snapshot["outcome_failures_consecutive"]) +
         "; last_error=" + str(snapshot["last_error"]),
         flush=True,
     )
@@ -2265,6 +2277,13 @@ def run_continuous_outcome_tracking_loop():
         flush=True,
     )
 
+    update_health(
+        outcome_worker_started=_utc_health_timestamp(),
+        last_outcome_error=None,
+        outcome_failures_consecutive=0,
+    )
+    print_health_heartbeat("outcome_worker_start")
+
     cycle = 0
 
     while True:
@@ -2287,6 +2306,7 @@ def run_continuous_outcome_tracking_loop():
         started = time.monotonic()
 
         print(prefix + "CYCLE " + str(cycle) + ": START", flush=True)
+        update_health(last_outcome_cycle=_utc_health_timestamp())
 
         try:
             connection = memory_engine.connect()
@@ -2304,6 +2324,12 @@ def run_continuous_outcome_tracking_loop():
                     ": SKIPPED (another outcome updater is running)",
                     flush=True,
                 )
+                duration = round(time.monotonic() - started, 3)
+                update_health(
+                    last_outcome_duration_seconds=duration,
+                    last_outcome_error=None,
+                )
+                print_health_heartbeat("outcome_worker_lock_skip")
                 continue
 
             real_dict_cursor = __import__(
@@ -2430,6 +2456,13 @@ def run_continuous_outcome_tracking_loop():
                 ": PASS (no sends or trades)",
                 flush=True,
             )
+            update_health(
+                last_outcome_success=_utc_health_timestamp(),
+                last_outcome_duration_seconds=duration,
+                last_outcome_error=None,
+                outcome_failures_consecutive=0,
+            )
+            print_health_heartbeat("outcome_worker")
 
         except Exception as exc:
             if connection is not None:
@@ -2447,6 +2480,15 @@ def run_continuous_outcome_tracking_loop():
                 secret_value = os.environ.get(secret_name)
                 if secret_value:
                     detail = detail.replace(secret_value, "[REDACTED]")
+
+            duration = round(time.monotonic() - started, 3)
+            with _health_lock:
+                _health_state["outcome_failures_consecutive"] += 1
+            update_health(
+                last_outcome_duration_seconds=duration,
+                last_outcome_error=type(exc).__name__,
+            )
+            print_health_heartbeat("outcome_worker_failure")
 
             print(
                 prefix + "CYCLE " + str(cycle) + ": FAIL (" +
