@@ -871,6 +871,9 @@ def calculate_outcome_fields(
         - opportunity_timestamp
     )
 
+    if direction not in ("LONG", "SHORT") or not math.isfinite(entry_price) or entry_price <= 0:
+        return {}
+
     fields = {}
 
     # ========================================================
@@ -968,15 +971,22 @@ def calculate_outcome_fields(
         ],
     )
 
-    # Do not report full-window MFE/MAE from partial history.
-    earliest = min((candle_timestamp_seconds(c) for c in candles
-                    if candle_timestamp_seconds(c) is not None), default=None)
-    latest = max((candle_timestamp_seconds(c) for c in candles
-                  if candle_timestamp_seconds(c) is not None), default=None)
-    full_window = (earliest is not None and latest is not None
-                   and earliest >= opportunity_timestamp
-                   and earliest < opportunity_timestamp + 60
-                   and latest + 60 >= opportunity_timestamp + available_horizon)
+    # MFE/MAE is derived only from fully closed one-minute candles.
+    # Require every complete minute wholly within the observation window;
+    # otherwise partial history could silently understate excursions.
+    # The initial/final fractional minute cannot be reconstructed exactly
+    # from OHLC candles, so these remain sampled (not exact) excursions.
+    minute = 60.0
+    first_open = math.ceil(opportunity_timestamp / minute) * minute
+    last_end = math.floor((opportunity_timestamp + available_horizon) / minute) * minute
+    expected_count = max(0, int(round((last_end - first_open) / minute)))
+    timestamps = [candle_timestamp_seconds(c) for c in candles]
+    observed = [ts for ts in timestamps if ts is not None and
+                first_open <= ts and ts + minute <= last_end]
+    expected = {int(round(first_open + i * minute)) for i in range(expected_count)}
+    actual = {int(round(ts)) for ts in observed}
+    full_window = (expected_count > 0 and len(observed) == expected_count
+                   and actual == expected)
     if available_horizon >= 60 and full_window:
 
         excursions = (
